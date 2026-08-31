@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.pytest_cache/
+.venv/
+.env
+.streamlit/secrets.toml
+*.grib2
+*.grib2.gz
+*.nc
+*.cdf
+*.zarr/
+output/
+build/
+dist/
+*.egg-info/

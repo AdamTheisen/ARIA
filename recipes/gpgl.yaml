@@ -1,0 +1,24 @@
+name: gpgl
+region:
+  name: GPGL
+  west: -104.1
+  east: -86.7
+  south: 36.9
+  north: 49.1
+sources:
+  surface:
+    variables: [air_temperature, dew_point_temperature, wind]
+    interpolation: barnes
+    resolution_km: 5
+  airnow:
+    variables: [pm25, ozone]
+    support_radius_km: 300
+  mrms:
+    product: MergedReflectivityQCComposite
+  hrrr:
+    variables: [air_temperature_2m, dew_point_temperature_2m, composite_reflectivity]
+storage:
+  backend: icechunk
+compute:
+  engine: dask
+  scheduler: threads
