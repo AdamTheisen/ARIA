@@ -59,22 +59,48 @@ st.title("ARIA — Atmospheric Regional Integration and Analysis")
 st.sidebar.caption(f"ARIA v{__version__}")
 
 
+
 st.sidebar.markdown("### Region")
 _region_choice = st.sidebar.selectbox(
     "Analysis region", list(REGION_PRESETS) + ["Custom"], index=0,
 )
+
 if _region_choice == "Custom":
-    cwest = st.sidebar.number_input("West longitude", value=-104.1, step=0.5, format="%.2f")
-    ceast = st.sidebar.number_input("East longitude", value=-86.7, step=0.5, format="%.2f")
-    csouth = st.sidebar.number_input("South latitude", value=36.9, step=0.5, format="%.2f")
-    cnorth = st.sidebar.number_input("North latitude", value=49.1, step=0.5, format="%.2f")
-    ACTIVE_REGION = Region(name="Custom", west=cwest, east=ceast, south=csouth, north=cnorth)
+    _region_mode = st.sidebar.radio(
+        "Region definition",
+        ["Center + radius", "Bounding box"],
+        horizontal=True,
+        key="custom-region-mode",
+    )
+    if _region_mode == "Center + radius":
+        c_lat = st.sidebar.number_input("Center latitude", value=44.0, step=0.25, format="%.3f")
+        c_lon = st.sidebar.number_input("Center longitude", value=-95.0, step=0.25, format="%.3f")
+        c_radius = st.sidebar.slider("Radius (km)", 50.0, 1000.0, 400.0, 25.0)
+        ACTIVE_REGION = Region.from_center_radius(
+            "Custom", c_lat, c_lon, c_radius
+        )
+        st.sidebar.caption(f"Site-centered domain • {c_radius:.0f} km radius")
+    else:
+        cwest = st.sidebar.number_input("West longitude", value=-104.1, step=0.5, format="%.2f")
+        ceast = st.sidebar.number_input("East longitude", value=-86.7, step=0.5, format="%.2f")
+        csouth = st.sidebar.number_input("South latitude", value=36.9, step=0.5, format="%.2f")
+        cnorth = st.sidebar.number_input("North latitude", value=49.1, step=0.5, format="%.2f")
+        ACTIVE_REGION = Region(
+            name="Custom", west=cwest, east=ceast, south=csouth, north=cnorth
+        )
 else:
     ACTIVE_REGION = REGION_PRESETS[_region_choice]
+
 REGION_CACHE_KEY = ACTIVE_REGION.cache_key
-if st.session_state.get("_aria_region_key") != REGION_CACHE_KEY:
+_region_changed = st.session_state.get("_aria_region_key") != REGION_CACHE_KEY
+if _region_changed:
     st.session_state["_aria_region_key"] = REGION_CACHE_KEY
+    # Streamlit caches do not automatically include globals such as ACTIVE_REGION
+    # in their cache key. Clearing on region change prevents one region's in-memory
+    # result from being returned for another region.
     st.cache_data.clear()
+    st.cache_resource.clear()
+
 st.sidebar.caption(
     f"{ACTIVE_REGION.west:.1f}° to {ACTIVE_REGION.east:.1f}° lon • "
     f"{ACTIVE_REGION.south:.1f}° to {ACTIVE_REGION.north:.1f}° lat"
@@ -96,17 +122,17 @@ def disk_cached(namespace, key, builder, max_age_seconds=None):
 
 
 @st.cache_data(ttl=300,show_spinner=False)
-def load_surface(method="barnes", smoothing_km=140.0, max_distance_km=250.0):
+def load_surface(region_key, method="barnes", smoothing_km=140.0, max_distance_km=250.0, include_history=False):
     bucket=time_bucket(5)
-    key=f"latest-{bucket}-{method}-{float(smoothing_km):g}-{float(max_distance_km):g}"
+    key=f"latest-{bucket}-{method}-{float(smoothing_km):g}-{float(max_distance_km):g}-hist{int(include_history)}"
     return disk_cached(
         "surface", key,
-        lambda: build_latest_surface(method=method,smoothing_km=smoothing_km,max_distance_km=max_distance_km),
+        lambda: build_latest_surface(region=ACTIVE_REGION,method=method,smoothing_km=smoothing_km,max_distance_km=max_distance_km,include_history=include_history),
         max_age_seconds=15*60,
     )
 
 @st.cache_data(ttl=3600,show_spinner=False)
-def load_atmosphere():
+def load_atmosphere(region_key):
     bucket=time_bucket(60)
     return disk_cached(
         "atmosphere",
@@ -116,11 +142,11 @@ def load_atmosphere():
     )
 
 @st.cache_data(ttl=1800,show_spinner=False)
-def load_air_quality(max_distance_km=300.0):
+def load_air_quality(region_key, max_distance_km=300.0):
     bucket=time_bucket(30)
     return disk_cached(
         "air_quality", f"latest-{bucket}-r{float(max_distance_km):g}",
-        lambda: build_latest_air_quality(max_distance_km=max_distance_km),
+        lambda: build_latest_air_quality(region=ACTIVE_REGION,max_distance_km=max_distance_km),
         max_age_seconds=2*3600,
     )
 
@@ -131,7 +157,7 @@ def load_radar(rid):
     return load_latest_nexrad(rid)
 
 @st.cache_data(ttl=300,show_spinner=False)
-def load_regional_radar():
+def load_regional_radar(region_key):
     bucket=time_bucket(5)
     return disk_cached(
         "regional_radar",
@@ -141,7 +167,7 @@ def load_regional_radar():
     )
 
 @st.cache_data(ttl=300,show_spinner=False)
-def load_regional_radar_fast(altitude_km, resolution_km):
+def load_regional_radar_fast(REGION_CACHE_KEY, region_key, altitude_km, resolution_km):
     bucket=time_bucket(5)
     key=f"cappi-{bucket}-z{float(altitude_km):g}-dx{float(resolution_km):g}"
     return disk_cached(
@@ -156,7 +182,7 @@ def load_regional_radar_fast(altitude_km, resolution_km):
     )
 
 @st.cache_data(ttl=1800,show_spinner=False)
-def load_hrrr_surface(cycle_iso, forecast_hour, variables):
+def load_hrrr_surface(region_key, cycle_iso, forecast_hour, variables):
     var_key="-".join(sorted(variables))
     key=f"{cycle_iso}-f{int(forecast_hour):02d}-sfc-{var_key}"
     return disk_cached(
@@ -171,7 +197,7 @@ def load_hrrr_surface(cycle_iso, forecast_hour, variables):
     )
 
 @st.cache_data(ttl=1800,show_spinner=False)
-def load_hrrr_pressure(cycle_iso, forecast_hour, variables):
+def load_hrrr_pressure(region_key, cycle_iso, forecast_hour, variables):
     var_key="-".join(sorted(variables))
     key=f"{cycle_iso}-f{int(forecast_hour):02d}-prs-{var_key}"
     return disk_cached(
@@ -186,7 +212,7 @@ def load_hrrr_pressure(cycle_iso, forecast_hour, variables):
     )
 
 @st.cache_data(ttl=1800,show_spinner=False)
-def load_hrrr_asos_comparison(cycle_iso, forecast_hour, variable):
+def load_hrrr_asos_comparison(region_key, cycle_iso, forecast_hour, variable):
     key=f"{cycle_iso}-f{int(forecast_hour):02d}-{variable}-stations"
     return disk_cached(
         "comparisons",
@@ -200,7 +226,7 @@ def load_hrrr_asos_comparison(cycle_iso, forecast_hour, variable):
     )
 
 @st.cache_data(ttl=1800,show_spinner=False)
-def load_hrrr_gridded_comparison(cycle_iso, forecast_hour, variable):
+def load_hrrr_gridded_comparison(region_key, cycle_iso, forecast_hour, variable):
     key=f"{cycle_iso}-f{int(forecast_hour):02d}-{variable}-surface-grid"
     return disk_cached(
         "comparisons",
@@ -214,7 +240,7 @@ def load_hrrr_gridded_comparison(cycle_iso, forecast_hour, variable):
     )
 
 @st.cache_data(ttl=1800,show_spinner=False)
-def load_hrrr_radar_comparison(cycle_iso, forecast_hour, model_variable, radar_resolution):
+def load_hrrr_radar_comparison(region_key, cycle_iso, forecast_hour, model_variable, radar_resolution):
     key=(
         f"{cycle_iso}-f{int(forecast_hour):02d}-{model_variable}"
         f"-radar-dx{float(radar_resolution):g}"
@@ -232,7 +258,7 @@ def load_hrrr_radar_comparison(cycle_iso, forecast_hour, model_variable, radar_r
     )
 
 @st.cache_data(ttl=300,show_spinner=False)
-def load_mrms(valid_iso=None):
+def load_mrms(region_key, valid_iso=None):
     key=f"mrms-{valid_iso or time_bucket(5)}"
     return disk_cached(
         "mrms",
@@ -242,7 +268,7 @@ def load_mrms(valid_iso=None):
     )
 
 @st.cache_data(ttl=1800,show_spinner=False)
-def load_hrrr_mrms_comparison(cycle_iso, forecast_hour, model_variable):
+def load_hrrr_mrms_comparison(region_key, cycle_iso, forecast_hour, model_variable):
     key=f"{cycle_iso}-f{int(forecast_hour):02d}-{model_variable}-mrms"
     return disk_cached(
         "comparisons",
@@ -256,7 +282,7 @@ def load_hrrr_mrms_comparison(cycle_iso, forecast_hour, model_variable):
     )
 
 @st.cache_data(ttl=1800,show_spinner=False)
-def load_hrrr_mrms_adapt_objects(cycle_iso, forecast_hour, model_variable, threshold_dbz, min_gridpoints, h_maxima_dbz, max_match_distance_km):
+def load_hrrr_mrms_adapt_objects(region_key, cycle_iso, forecast_hour, model_variable, threshold_dbz, min_gridpoints, h_maxima_dbz, max_match_distance_km):
     key=(
         f"{cycle_iso}-f{int(forecast_hour):02d}-{model_variable}-adapt"
         f"-z{float(threshold_dbz):g}-n{int(min_gridpoints)}"
@@ -278,7 +304,7 @@ def load_hrrr_mrms_adapt_objects(cycle_iso, forecast_hour, model_variable, thres
     )
 
 @st.cache_data(ttl=1800,show_spinner=False)
-def load_hrrr_radar_leads(valid_iso, model_variable, forecast_hours):
+def load_hrrr_radar_leads(region_key, valid_iso, model_variable, forecast_hours):
     leads="-".join(str(int(x)) for x in forecast_hours)
     key=f"{valid_iso}-{model_variable}-radar-leads-{leads}"
     return disk_cached(
@@ -293,7 +319,7 @@ def load_hrrr_radar_leads(valid_iso, model_variable, forecast_hours):
     )
 
 @st.cache_data(ttl=1800,show_spinner=False)
-def load_hrrr_lead_verification(valid_iso, variable, forecast_hours):
+def load_hrrr_lead_verification(region_key, valid_iso, variable, forecast_hours):
     leads="-".join(str(int(x)) for x in forecast_hours)
     key=f"{valid_iso}-{variable}-leads-{leads}"
     return disk_cached(
@@ -308,7 +334,7 @@ def load_hrrr_lead_verification(valid_iso, variable, forecast_hours):
     )
 
 @st.cache_data(ttl=3600,show_spinner=False)
-def load_hrrr_raob_comparison(cycle_iso, forecast_hour, variable, station_id=None):
+def load_hrrr_raob_comparison(region_key, cycle_iso, forecast_hour, variable, station_id=None):
     key=f"{cycle_iso}-f{int(forecast_hour):02d}-{variable}-raob-{station_id or 'auto'}"
     return disk_cached(
         "comparisons",
@@ -324,7 +350,7 @@ def load_hrrr_raob_comparison(cycle_iso, forecast_hour, variable, station_id=Non
 
 
 @st.cache_data(ttl=3600,show_spinner=False)
-def load_latest_hrrr_raob(variable, station_id=None):
+def load_latest_hrrr_raob(region_key, variable, station_id=None):
     key=f"latest-auto-{variable}-raob-{station_id or 'auto'}"
     return disk_cached(
         "comparisons", key,
@@ -381,8 +407,17 @@ if view in ("Surface","Coverage"):
     surface_method=st.sidebar.selectbox("Surface interpolation",["Barnes","Gaussian","IDW"],index=0)
     surface_smoothing=st.sidebar.slider("Smoothing scale (km)",40.0,300.0,140.0,10.0)
     surface_support=st.sidebar.slider("Maximum station support (km)",75.0,400.0,250.0,25.0)
-    surface,obs,start,end=load_surface(surface_method.lower(),surface_smoothing,surface_support)
-    idx=st.sidebar.slider("Analysis time",0,surface.sizes["time"]-1,surface.sizes["time"]-1)
+    surface_history=st.sidebar.checkbox(
+        "Load previous hour",value=False,
+        help="Off is much faster: ARIA computes only the latest analysis. Turn on to build the full 5-minute timeline."
+    )
+    surface,obs,start,end=load_surface(
+        REGION_CACHE_KEY, surface_method.lower(),surface_smoothing,surface_support,surface_history
+    )
+    if surface.sizes["time"] > 1:
+        idx=st.sidebar.slider("Analysis time",0,surface.sizes["time"]-1,surface.sizes["time"]-1)
+    else:
+        idx=0
     status_line("ASOS",surface.time.values[idx],5)
     if view=="Surface":
         cmap,vmin,vmax=color_controls("Temperature","coolwarm",surface.air_temperature_f.values)
@@ -405,7 +440,7 @@ if view in ("Surface","Coverage"):
 elif view=="Air Quality":
     try:
         aq_radius=st.sidebar.slider("Monitor support radius (km)",100.0,500.0,300.0,25.0)
-        cube,latest,allobs,t=load_air_quality(aq_radius); status_line("AirNow",t,30)
+        cube,latest,allobs,t=load_air_quality(REGION_CACHE_KEY, aq_radius); status_line("AirNow",t,30)
         cmap,vmin,vmax=color_controls("PM2.5","viridis",cube.pm25.values if "pm25" in cube else np.array([]),0,None)
         if st.sidebar.checkbox("Interactive map",True,key="aq-interactive") and "pm25" in cube:
             fig=plot_interactive_field(cube.pm25.isel(time=-1),ACTIVE_REGION,title="AirNow PM2.5",
@@ -485,7 +520,7 @@ elif view=="Regional Radar":
             with st.spinner(
                 "Fetching latest radar volumes in parallel and gridding selected altitude..."
             ):
-                cube,scans,diag=load_regional_radar_fast(
+                cube,scans,diag=load_regional_radar_fast(REGION_CACHE_KEY, 
                     altitude,resolution
                 )
 
@@ -512,7 +547,7 @@ elif view=="Regional Radar":
 
         else:
             with st.spinner("Building detailed 3-D regional radar cube..."):
-                cube,scans,diag=load_regional_radar()
+                cube,scans,diag=load_regional_radar(REGION_CACHE_KEY)
 
             status_line("Regional NEXRAD",diag["newest_scan_time"],5)
 
@@ -624,7 +659,7 @@ elif view=="Model":
                 with st.spinner(
                     "Retrieving selected HRRR GRIB messages and subsetting the active region..."
                 ):
-                    model_ds,run=load_hrrr_surface(
+                    model_ds,run=load_hrrr_surface(REGION_CACHE_KEY, 
                         pd.Timestamp(cycle).isoformat(),
                         fxx,
                         tuple(fetch_vars),
@@ -657,7 +692,7 @@ elif view=="Model":
 
                 if overlay_radar:
                     with st.spinner("Loading regional NEXRAD overlay..."):
-                        radar_cube,radar_scans,radar_diag=load_regional_radar_fast(
+                        radar_cube,radar_scans,radar_diag=load_regional_radar_fast(REGION_CACHE_KEY, 
                             2.0,8.0
                         )
                     fig=overlay_regional_radar(
@@ -694,7 +729,7 @@ elif view=="Model":
                         )
                         if st.button("Build gridded surface comparison",key=f"grid-{variable}-{fxx}"):
                             with st.spinner("Building valid-time ASOS analysis and HRRR difference field..."):
-                                _,_,_,_,grid_comp=load_hrrr_gridded_comparison(
+                                _,_,_,_,grid_comp=load_hrrr_gridded_comparison(REGION_CACHE_KEY, 
                                     pd.Timestamp(cycle).isoformat(),
                                     fxx,
                                     variable,
@@ -721,7 +756,7 @@ elif view=="Model":
                         )
                         if st.button("Build HRRR / NEXRAD comparison",key=f"radar-comp-{variable}-{fxx}"):
                             with st.spinner("Loading historical-valid-time NEXRAD and building difference field..."):
-                                _,_,_,_,_,radar_comp,radar_metrics=load_hrrr_radar_comparison(
+                                _,_,_,_,_,radar_comp,radar_metrics=load_hrrr_radar_comparison(REGION_CACHE_KEY, 
                                     pd.Timestamp(cycle).isoformat(),
                                     fxx,
                                     variable,
@@ -750,7 +785,7 @@ elif view=="Model":
                     st.markdown("### Model vs ASOS")
                     if st.button("Run ASOS comparison"):
                         with st.spinner("Matching HRRR to ASOS observations..."):
-                            _,_,comp,metrics=load_hrrr_asos_comparison(
+                            _,_,comp,metrics=load_hrrr_asos_comparison(REGION_CACHE_KEY, 
                                 pd.Timestamp(cycle).isoformat(),
                                 fxx,
                                 variable,
@@ -811,7 +846,7 @@ elif view=="Model":
                 with st.spinner(
                     "Retrieving HRRR pressure-level GRIB messages..."
                 ):
-                    model_ds,run=load_hrrr_pressure(
+                    model_ds,run=load_hrrr_pressure(REGION_CACHE_KEY, 
                         pd.Timestamp(cycle).isoformat(),
                         fxx,
                         tuple(fetch_vars),
@@ -899,7 +934,7 @@ elif view=="Model":
                     if st.button("Load HRRR / radiosonde profile",key="load-sonde-profile"):
                         with st.spinner("Loading pressure-level HRRR and radiosonde profile..."):
                             if sonde_time_mode=="Automatic latest":
-                                _,run_auto,profiles,station_id,profile_comp,match_info=load_latest_hrrr_raob(
+                                _,run_auto,profiles,station_id,profile_comp,match_info=load_latest_hrrr_raob(REGION_CACHE_KEY, 
                                     sonde_variable,None
                                 )
                                 if match_info:
@@ -909,7 +944,7 @@ elif view=="Model":
                                     c3.metric("Forecast",f'F{int(match_info["forecast_hour"]):02d}')
                                     c4.metric("Time offset",f'{match_info["offset_minutes"]:+.0f} min')
                             else:
-                                _,_,profiles,station_id,profile_comp=load_hrrr_raob_comparison(
+                                _,_,profiles,station_id,profile_comp=load_hrrr_raob_comparison(REGION_CACHE_KEY, 
                                     pd.Timestamp(cycle).isoformat(),
                                     fxx,
                                     sonde_variable,
@@ -926,7 +961,7 @@ elif view=="Model":
                                 key="sonde-station-result",
                             )
                             if selected!=station_id:
-                                _,_,profiles,station_id,profile_comp=load_hrrr_raob_comparison(
+                                _,_,profiles,station_id,profile_comp=load_hrrr_raob_comparison(REGION_CACHE_KEY, 
                                     pd.Timestamp(cycle).isoformat(),
                                     fxx,
                                     sonde_variable,
@@ -1001,7 +1036,7 @@ elif view=="Storm Explorer":
         )
         if st.button("Build surface comparison",key="storm-build-surface"):
             with st.spinner("Building HRRR, ARIA regional surface analysis, and difference field..."):
-                _,run,_,observations,comparison=load_hrrr_gridded_comparison(
+                _,run,_,observations,comparison=load_hrrr_gridded_comparison(REGION_CACHE_KEY, 
                     pd.Timestamp(cycle).isoformat(),
                     fxx,
                     surface_variable,
@@ -1037,7 +1072,7 @@ elif view=="Storm Explorer":
         )
         if st.button("Build radar comparison",key="storm-build-radar"):
             with st.spinner("Loading valid-time MRMS QC composite and HRRR reflectivity..."):
-                _,run,radar,scan_time,comparison,metrics,fss=load_hrrr_mrms_comparison(
+                _,run,radar,scan_time,comparison,metrics,fss=load_hrrr_mrms_comparison(REGION_CACHE_KEY, 
                     pd.Timestamp(cycle).isoformat(), fxx, reflectivity_variable
                 )
             fig=plot_interactive_three_panel(
@@ -1073,7 +1108,7 @@ elif view=="Storm Explorer":
             st.caption("Each HRRR lead verifies against the same ARIA regional surface analysis at the selected valid time.")
             if st.button("Run surface lead-time verification",key="storm-run-leads") and leads:
                 with st.spinner("Retrieving HRRR cycles and comparing against one valid-time surface analysis..."):
-                    metrics,comparisons,_,_=load_hrrr_lead_verification(valid_time.isoformat(),lead_variable,tuple(leads))
+                    metrics,comparisons,_,_=load_hrrr_lead_verification(REGION_CACHE_KEY, valid_time.isoformat(),lead_variable,tuple(leads))
                 st.dataframe(metrics,use_container_width=True,hide_index=True)
                 good=metrics.dropna(subset=["rmse"])
                 if not good.empty:
@@ -1088,7 +1123,7 @@ elif view=="Storm Explorer":
             st.caption("All forecast leads verify against one cached MRMS QC composite at the selected valid time. CSI/POD/FAR are shown by dBZ threshold; FSS adds spatial tolerance.")
             if st.button("Run radar lead-time verification",key="storm-run-radar-leads") and leads:
                 with st.spinner("Loading one MRMS field and HRRR reflectivity for each forecast lead..."):
-                    metrics,fss,comparisons,radar,scan_time=load_hrrr_radar_leads(valid_time.isoformat(),lead_radar_variable,tuple(leads))
+                    metrics,fss,comparisons,radar,scan_time=load_hrrr_radar_leads(REGION_CACHE_KEY, valid_time.isoformat(),lead_radar_variable,tuple(leads))
                 st.markdown("**Categorical scores by lead and threshold**")
                 st.dataframe(metrics,use_container_width=True,hide_index=True)
                 st.markdown("**Fractions Skill Score by lead, threshold, and neighborhood**")
@@ -1132,7 +1167,7 @@ elif view=="Storm Explorer":
             )
             if st.button("Identify and match storm objects",key="storm-run-adapt-objects"):
                 with st.spinner("Running ADAPT segmentation on HRRR and MRMS, then matching storm objects..."):
-                    _,run,_,scan_time,comparison,obj_result=load_hrrr_mrms_adapt_objects(
+                    _,run,_,scan_time,comparison,obj_result=load_hrrr_mrms_adapt_objects(REGION_CACHE_KEY, 
                         pd.Timestamp(cycle).isoformat(), fxx, "composite_reflectivity",
                         threshold, int(min_points), hmax, max_distance,
                     )
@@ -1168,7 +1203,7 @@ elif view=="Storm Explorer":
                     st.dataframe(obs_objects.round(2),use_container_width=True,hide_index=True)
 
 else:
-    atmosphere,profiles,trajectories,points=load_atmosphere()
+    atmosphere,profiles,trajectories,points=load_atmosphere(REGION_CACHE_KEY)
     cycle=atmosphere.attrs.get("raob_cycle","unknown")
     if cycle!="unknown": status_line("RAOB",cycle,60)
     available=[v for v in VARIABLE_STYLE if v in atmosphere]

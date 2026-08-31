@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from functools import lru_cache
+import math
 
 STATE_NAMES = {
     "AL":"Alabama","AK":"Alaska","AZ":"Arizona","AR":"Arkansas","CA":"California",
@@ -137,6 +138,32 @@ class Region:
             & (longitude >= self.west) & (longitude <= self.east)
         )
 
+
+@classmethod
+def from_center_radius(cls, name, center_lat, center_lon, radius_km, **kwargs):
+    """Build a rectangular query region around a center point and radius.
+
+    The rectangle fully contains the requested circular radius. This keeps
+    provider queries simple while exposing a more natural site-centered
+    definition to ARIA users.
+    """
+    center_lat = float(center_lat)
+    center_lon = float(center_lon)
+    radius_km = float(radius_km)
+    if radius_km <= 0:
+        raise ValueError("radius_km must be positive.")
+    lat_delta = radius_km / 111.0
+    coslat = max(math.cos(math.radians(center_lat)), 0.15)
+    lon_delta = radius_km / (111.0 * coslat)
+    return cls(
+        name=name,
+        west=center_lon - lon_delta,
+        east=center_lon + lon_delta,
+        south=center_lat - lat_delta,
+        north=center_lat + lat_delta,
+        **kwargs,
+    )
+
     def as_dict(self):
         return {
             "name": self.name, "west": self.west, "south": self.south,
@@ -148,7 +175,9 @@ GPGL_REGION = Region(
     name="GPGL", west=-104.1, south=36.9, east=-86.7, north=49.1,
     states=PRIMARY_STATES, query_states_override=RECTANGLE_STATES,
 )
-SGP_REGION = Region(name="ARM SGP", west=-99.5, south=34.0, east=-95.0, north=38.5)
+SGP_REGION = Region.from_center_radius(
+    name="ARM SGP", center_lat=36.605, center_lon=-97.485, radius_km=400.0
+)
 UPPER_MIDWEST_REGION = Region(name="Upper Midwest", west=-100.5, south=40.0, east=-84.0, north=50.0)
 CONUS_REGION = Region(name="CONUS", west=-125.0, south=24.0, east=-66.5, north=50.0)
 

@@ -149,16 +149,24 @@ def build_latest_surface(
     method="barnes",
     smoothing_km=140.0,
     max_distance_km=250.0,
+    include_history=False,
 ):
     start, end = latest_complete_hour(
         lag_minutes=lag_minutes
     )
 
-    analysis_times = pd.date_range(
-        start=start,
-        end=end - pd.Timedelta(analysis_interval),
-        freq=analysis_interval,
-    )
+    latest_time = end - pd.Timedelta(analysis_interval)
+    if include_history:
+        analysis_times = pd.date_range(
+            start=start,
+            end=latest_time,
+            freq=analysis_interval,
+        )
+    else:
+        # The dashboard normally displays only the latest field. Building the
+        # entire preceding hour multiplies Barnes work by ~12, so history is
+        # opt-in and computed only when the user asks for it.
+        analysis_times = pd.DatetimeIndex([latest_time])
 
     observations = fetch_asos_tidy(
         region,

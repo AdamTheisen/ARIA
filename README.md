@@ -7,6 +7,23 @@ analyzing, comparing, and visualizing regional atmospheric observations and mode
 data. The original Great Plains / Great Lakes (GPGL) domain is now one built-in
 region rather than the identity of the software.
 
+
+## AI-assisted development disclosure
+
+ARIA has been developed with substantial assistance from **OpenAI ChatGPT**.
+The current development work for this release was performed using **GPT-5.6 Sol**
+in ChatGPT.
+
+ChatGPT has been used for software architecture, code generation and refactoring,
+debugging, documentation, workflow design, and test scaffolding. Human review,
+scientific validation, operational testing, and acceptance remain the
+responsibility of the ARIA maintainers. AI-generated code should be reviewed and
+tested in the same manner as any other contributed code, especially for
+scientific calculations, quality control, data provenance, and operational use.
+
+This disclosure should be updated if materially different AI systems or model
+versions are used for future development.
+
 ## What ARIA does
 
 ARIA integrates surface observations, air quality, radiosondes, NEXRAD,
@@ -121,3 +138,28 @@ discovery.
 - Fixed an import-time `NameError` in `build_latest_regional_radar_fast` where the
   default argument incorrectly referenced `region` before it existed.
 - Removed the transitional `aria_atmos` wrapper and legacy `gpgl` CLI alias.
+
+
+## v0.16.3
+
+Surface-analysis performance release.
+
+- Barnes/Gaussian interpolation now limits each grid point to the nearest 64
+  supported stations instead of querying every station in the region.
+- `cKDTree.query` uses SciPy worker parallelism and a hard distance upper bound.
+- Analysis-grid Cartesian coordinates are cached once per builder.
+- Barnes residual sampling is vectorized.
+- The Surface and Coverage views now compute only the latest 5-minute analysis
+  by default. `Load previous hour` restores the full 5-minute timeline when needed.
+- Surface and Air Quality dashboard builders explicitly receive the active ARIA region.
+
+
+## v0.16.4
+
+- Added center + radius region definitions in addition to rectangular bounds.
+- Expanded ARM SGP to a 400 km site-centered default domain.
+- Added Custom region controls for center/radius or explicit bounding box.
+- Fixed cross-region Streamlit caching by making the region cache key an explicit
+  argument to cached loader functions and clearing in-memory resources on region changes.
+- Added explicit AI-assisted development provenance documenting use of OpenAI
+  ChatGPT GPT-5.6 Sol.

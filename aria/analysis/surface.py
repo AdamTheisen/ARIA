@@ -25,6 +25,10 @@ class SurfaceAnalysisConfig:
 
     method: str = "barnes"
     smoothing_km: float = 140.0
+    # Limit Gaussian/Barnes neighbors instead of allocating every station at
+    # every grid point. 64 is ample for the regional station density while
+    # avoiding the very large Ngrid x Nstation arrays used previously.
+    kernel_k: int = 64
 
     idw_k: int = 12
     idw_power: float = 2.0
@@ -64,6 +68,8 @@ class SurfaceAnalysisBuilder:
         self.lon2d, self.lat2d = np.meshgrid(self.lon, self.lat)
 
         self.lat0 = float(np.nanmean(self.lat))
+        # Every interpolation pass uses the same analysis grid.
+        self._targets_xy = self._xy(self.lat2d, self.lon2d)
 
     def _xy(self, latitude, longitude):
         latitude = np.asarray(latitude, dtype=float)
@@ -150,12 +156,12 @@ class SurfaceAnalysisBuilder:
         age_minutes = age_minutes[valid]
 
         points = self._xy(latitude, longitude)
-        targets = self._xy(self.lat2d, self.lon2d)
+        targets = self._targets_xy
 
         tree = cKDTree(points)
         k_use = min(int(k), len(values))
 
-        distance, index = tree.query(targets, k=k_use)
+        distance, index = tree.query(targets, k=k_use, workers=-1)
 
         if k_use == 1:
             distance = distance[:, None]
@@ -207,39 +213,119 @@ class SurfaceAnalysisBuilder:
         )
 
 
-    def _spatiotemporal_kernel(self, latitude, longitude, values, age_minutes, *, sigma_km, max_distance_km, min_neighbors):
-        latitude=np.asarray(latitude,float); longitude=np.asarray(longitude,float)
-        values=np.asarray(values,float); age_minutes=np.asarray(age_minutes,float)
-        valid=np.isfinite(latitude)&np.isfinite(longitude)&np.isfinite(values)&np.isfinite(age_minutes)
-        shape=self.lat2d.shape
-        if valid.sum()==0:
-            return np.full(shape,np.nan),np.full(shape,np.nan),np.zeros(shape,dtype=np.int16),np.full(shape,np.nan)
-        latitude=latitude[valid]; longitude=longitude[valid]; values=values[valid]; age_minutes=age_minutes[valid]
-        points=self._xy(latitude,longitude); targets=self._xy(self.lat2d,self.lon2d)
-        tree=cKDTree(points); distance,index=tree.query(targets,k=len(values))
-        if len(values)==1:
-            distance=distance[:,None]; index=index[:,None]
-        neighbor_values=values[index]; neighbor_ages=age_minutes[index]
-        spatial=np.exp(-0.5*(distance/max(float(sigma_km),1.0))**2)
-        spatial=np.where(distance<=max_distance_km,spatial,0.0)
-        temporal=np.exp(-neighbor_ages/max(self.config.temporal_decay_minutes,1e-6))
-        weights=spatial*temporal
-        n=np.sum(weights>0,axis=1); den=np.sum(weights,axis=1); num=np.sum(weights*neighbor_values,axis=1)
-        good=(den>0)&(n>=min_neighbors); out=np.full(len(targets),np.nan); out[good]=num[good]/den[good]
-        age=np.full(len(targets),np.nan); age_num=np.sum(weights*neighbor_ages,axis=1); age[good]=age_num[good]/den[good]
-        near=np.min(distance,axis=1); near[~good]=np.nan
-        return out.reshape(shape),near.reshape(shape),n.reshape(shape).astype(np.int16),age.reshape(shape)
+    def _spatiotemporal_kernel(
+        self,
+        latitude,
+        longitude,
+        values,
+        age_minutes,
+        *,
+        sigma_km,
+        max_distance_km,
+        min_neighbors,
+    ):
+        """Gaussian space/time analysis using a bounded nearest-neighbor query.
+
+        Earlier ARIA versions queried *every* observation for *every* grid point.
+        For a regional grid this created large temporary distance/index arrays and
+        repeated that cost for every variable, analysis time, and Barnes pass.
+
+        The Gaussian kernel has finite practical support, so only the nearest
+        ``kernel_k`` stations inside ``max_distance_km`` are needed here.
+        """
+        latitude = np.asarray(latitude, float)
+        longitude = np.asarray(longitude, float)
+        values = np.asarray(values, float)
+        age_minutes = np.asarray(age_minutes, float)
+
+        valid = (
+            np.isfinite(latitude)
+            & np.isfinite(longitude)
+            & np.isfinite(values)
+            & np.isfinite(age_minutes)
+        )
+        shape = self.lat2d.shape
+        n_valid = int(valid.sum())
+        if n_valid == 0:
+            return (
+                np.full(shape, np.nan),
+                np.full(shape, np.nan),
+                np.zeros(shape, dtype=np.int16),
+                np.full(shape, np.nan),
+            )
+
+        latitude = latitude[valid]
+        longitude = longitude[valid]
+        values = values[valid]
+        age_minutes = age_minutes[valid]
+
+        points = self._xy(latitude, longitude)
+        targets = self._targets_xy
+        tree = cKDTree(points)
+
+        k_use = min(max(int(self.config.kernel_k), int(min_neighbors)), n_valid)
+        distance, index = tree.query(
+            targets,
+            k=k_use,
+            distance_upper_bound=float(max_distance_km),
+            workers=-1,
+        )
+        if k_use == 1:
+            distance = distance[:, None]
+            index = index[:, None]
+
+        # scipy returns index == n_valid for missing neighbors when an upper
+        # distance bound is supplied. Map those to a safe slot and zero weight.
+        missing = (~np.isfinite(distance)) | (index >= n_valid)
+        safe_index = np.where(missing, 0, index)
+        neighbor_values = values[safe_index]
+        neighbor_ages = age_minutes[safe_index]
+
+        spatial = np.exp(
+            -0.5 * (distance / max(float(sigma_km), 1.0)) ** 2
+        )
+        spatial[missing] = 0.0
+
+        temporal = np.exp(
+            -neighbor_ages
+            / max(self.config.temporal_decay_minutes, 1.0e-6)
+        )
+        weights = spatial * temporal
+
+        n = np.sum(weights > 0.0, axis=1)
+        den = np.sum(weights, axis=1)
+        num = np.sum(weights * neighbor_values, axis=1)
+
+        good = (den > 0.0) & (n >= int(min_neighbors))
+        out = np.full(len(targets), np.nan)
+        out[good] = num[good] / den[good]
+
+        age = np.full(len(targets), np.nan)
+        age_num = np.sum(weights * neighbor_ages, axis=1)
+        age[good] = age_num[good] / den[good]
+
+        nearest = np.min(distance, axis=1)
+        nearest[~good] = np.nan
+
+        return (
+            out.reshape(shape),
+            nearest.reshape(shape),
+            n.reshape(shape).astype(np.int16),
+            age.reshape(shape),
+        )
 
     def _barnes(self, latitude, longitude, values, age_minutes):
         first,near,n,age=self._spatiotemporal_kernel(latitude,longitude,values,age_minutes,
             sigma_km=self.config.smoothing_km/np.sqrt(2.0),max_distance_km=self.config.max_distance_km,
             min_neighbors=self.config.min_neighbors)
         # Barnes residual correction sampled at nearest analysis-grid point.
-        glon=self.lon; glat=self.lat; residual=[]
-        for lo,la,v in zip(longitude,latitude,values):
-            ix=int(np.argmin(np.abs(glon-float(lo)))); iy=int(np.argmin(np.abs(glat-float(la))))
-            residual.append(float(v)-first[iy,ix] if np.isfinite(first[iy,ix]) else np.nan)
-        corr,_,_,_=self._spatiotemporal_kernel(latitude,longitude,np.asarray(residual),age_minutes,
+        # Vectorized nearest-grid lookup avoids a station-by-station Python loop.
+        lon_obs=np.asarray(longitude,float); lat_obs=np.asarray(latitude,float)
+        ix=np.abs(self.lon[None,:]-lon_obs[:,None]).argmin(axis=1)
+        iy=np.abs(self.lat[None,:]-lat_obs[:,None]).argmin(axis=1)
+        sampled=first[iy,ix]
+        residual=np.where(np.isfinite(sampled),np.asarray(values,float)-sampled,np.nan)
+        corr,_,_,_=self._spatiotemporal_kernel(latitude,longitude,residual,age_minutes,
             sigma_km=max(20.0,self.config.smoothing_km*0.38),max_distance_km=self.config.max_distance_km,
             min_neighbors=self.config.min_neighbors)
         return first+np.nan_to_num(corr,nan=0.0),near,n,age
