@@ -163,3 +163,60 @@ Surface-analysis performance release.
   argument to cached loader functions and clearing in-memory resources on region changes.
 - Added explicit AI-assisted development provenance documenting use of OpenAI
   ChatGPT GPT-5.6 Sol.
+
+
+## v0.16.5
+
+- Fixed `Region.from_center_radius()` being accidentally defined at module scope
+  instead of as a `Region` class method.
+- Restored `Region.as_dict()` as a normal class method; it had also been nested
+  incorrectly beneath the misplaced center/radius function.
+- Added an import/runtime sanity check for the SGP preset.
+
+
+## v0.16.6
+
+- Fixed circular/lobed artifacts in Barnes/Gaussian analyses introduced by the
+  v0.16.3 bounded-neighbor optimization.
+- The nearest 64 stations are still used for performance, but Gaussian/Barnes
+  weights are now evaluated continuously; the support radius is applied to the
+  nearest-observation distance rather than independently truncating every neighbor.
+- Storm Explorer surface comparisons now use a 35-minute past-only observation
+  window to better capture routine METAR reports near the model valid time.
+
+
+## v0.16.7
+
+- Tightened Storm Explorer surface-observation matching to a **15-minute,
+  past-only** window ending at the HRRR valid time.
+- Restored the intended Model | Observation | Difference comparison layout:
+  Model and Observation share one **horizontal colorbar below the first two
+  panels**, while Difference has a separate **horizontal symmetric colorbar
+  below the third panel**.
+- Increased interactive comparison bottom spacing so colorbars do not overlap
+  map panels, axes, or each other.
+
+## v0.17.0
+
+- Added a **Region Configuration** start screen. ARIA now opens by defining or
+  selecting the analysis region before data workflows are launched.
+- Added persistent user-defined regions with **Save** and **Delete** controls;
+  built-in ARIA regions remain read-only.
+- Added regional observing-system inventory statistics and map preview for
+  recently reporting surface stations, operational NEXRAD radars, radiosonde
+  sites, and inferred state-query coverage.
+- Added expandable station/radar/sonde inventories to make the source coverage
+  behind a region visible before analysis begins.
+- Added a **Change region** action after launch while retaining explicit
+  region-scoped cache behavior.
+- Fixed the interactive Surface colormap control so changing the selected
+  colormap updates the Plotly map rather than leaving it hard-coded to RdBu_r.
+- Radiosonde/HRRR automatic comparison now displays sonde launch time, HRRR
+  initialization, forecast lead, HRRR valid time, and model/sonde time offset.
+- Retains the v0.16.7 Storm Explorer 15-minute past-only observation window and
+  horizontal comparison colorbars.
+
+The planned ~3-km physical surface grid is intentionally not enabled in this
+release. At regional scale it needs chunked Barnes evaluation to avoid a large
+nearest-neighbor working array; the current 0.1-degree surface grid remains the
+safe default until that performance work is completed.

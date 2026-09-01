@@ -416,6 +416,18 @@ def _geographic_y_scale(region):
     return 1.0 / max(coslat, 0.2)
 
 
+def mpl_to_plotly_colorscale(cmap_name, samples=21):
+    """Convert a Matplotlib colormap name to a Plotly colorscale."""
+    import matplotlib as mpl
+    cmap = mpl.colormaps.get_cmap(cmap_name)
+    values = []
+    for i in range(samples):
+        x = i / (samples - 1)
+        r, g, b, _ = cmap(x)
+        values.append([x, f"rgb({int(round(255*r))},{int(round(255*g))},{int(round(255*b))})"])
+    return values
+
+
 def plot_interactive_field(da, region, *, title, units="", zmin=None, zmax=None, colorscale="Turbo", state_color="rgba(20,20,20,.95)"):
     """Interactive regular-lat/lon field with state boundaries and pan/zoom."""
     import plotly.graph_objects as go
@@ -487,12 +499,57 @@ def plot_interactive_three_panel(
 
     fig=make_subplots(rows=1,cols=3,shared_yaxes=True,subplot_titles=panel_titles,horizontal_spacing=.035)
     hover="Lon %{x:.2f}<br>Lat %{y:.2f}<br>Value %{z:.1f}<extra></extra>"
-    fig.add_trace(go.Heatmap(x=lon,y=lat,z=m,zmin=vmin,zmax=vmax,colorscale=colorscale,
-                             colorbar=dict(title=comparison.attrs.get("units",""),x=.30),hovertemplate=hover),row=1,col=1)
-    fig.add_trace(go.Heatmap(x=lon,y=lat,z=o,zmin=vmin,zmax=vmax,colorscale=colorscale,showscale=False,
-                             hovertemplate=hover),row=1,col=2)
-    fig.add_trace(go.Heatmap(x=lon,y=lat,z=d,zmin=-difference_limit,zmax=difference_limit,colorscale="RdBu_r",
-                             colorbar=dict(title="Difference",x=1.01),hovertemplate=hover),row=1,col=3)
+
+    units=comparison.attrs.get("units","")
+    shared_bar_title=units if units else "Value"
+    difference_bar_title=f"Difference ({units})" if units else "Difference"
+
+    # Model and Observation intentionally share one horizontal colorbar.  The
+    # Difference panel uses its own symmetric diverging bar.  Keeping both bars
+    # below the maps preserves panel width and prevents colorbars from obscuring
+    # the plotted domains.
+    fig.add_trace(
+        go.Heatmap(
+            x=lon,y=lat,z=m,zmin=vmin,zmax=vmax,colorscale=colorscale,
+            colorbar=dict(
+                title=dict(text=shared_bar_title,side="bottom"),
+                orientation="h",
+                x=0.325,
+                xanchor="center",
+                y=-0.16,
+                yanchor="top",
+                len=0.60,
+                thickness=16,
+            ),
+            hovertemplate=hover,
+        ),
+        row=1,col=1,
+    )
+    fig.add_trace(
+        go.Heatmap(
+            x=lon,y=lat,z=o,zmin=vmin,zmax=vmax,colorscale=colorscale,
+            showscale=False,hovertemplate=hover,
+        ),
+        row=1,col=2,
+    )
+    fig.add_trace(
+        go.Heatmap(
+            x=lon,y=lat,z=d,zmin=-difference_limit,zmax=difference_limit,
+            colorscale="RdBu_r",
+            colorbar=dict(
+                title=dict(text=difference_bar_title,side="bottom"),
+                orientation="h",
+                x=0.845,
+                xanchor="center",
+                y=-0.16,
+                yanchor="top",
+                len=0.27,
+                thickness=16,
+            ),
+            hovertemplate=hover,
+        ),
+        row=1,col=3,
+    )
 
     for x,y in _interactive_state_lines(region):
         for col in (1,2,3):
@@ -521,9 +578,9 @@ def plot_interactive_three_panel(
         )
     fig.update_layout(
         title=title or comparison.attrs.get("comparison","Model / Observation Comparison"),
-        height=620,
+        height=700,
         dragmode="zoom",
-        margin=dict(l=45,r=45,t=85,b=40),
+        margin=dict(l=45,r=45,t=85,b=125),
     )
     return fig
 

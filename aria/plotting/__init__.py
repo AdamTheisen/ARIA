@@ -20,7 +20,7 @@ from .atmosphere import make_3d_slice_explorer
 
 from .atmosphere import plot_atmosphere_slice, make_3d_variable_slice_explorer, VARIABLE_STYLE
 
-from .model import (MODEL_STYLE, plot_model_field, plot_model_cross_section, overlay_regional_radar, plot_three_panel_comparison, plot_radar_three_panel, plot_profile_comparison, plot_interactive_three_panel, plot_interactive_field)
+from .model import (MODEL_STYLE, plot_model_field, plot_model_cross_section, overlay_regional_radar, plot_three_panel_comparison, plot_radar_three_panel, plot_profile_comparison, plot_interactive_three_panel, plot_interactive_field, mpl_to_plotly_colorscale)
 
 from .model import plot_adapt_storm_objects
 

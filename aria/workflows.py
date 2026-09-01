@@ -570,11 +570,12 @@ def build_surface_at_valid_time(
     valid_time,
     *,
     region=GPGL_REGION,
-    lookback="20min",
+    lookback="15min",
 ):
     """
-    Build one GPGL surface analysis centered on a requested model valid time.
-    Observations are past-only relative to the requested valid time.
+    Build one regional surface analysis at a requested model valid time.
+    Observations are past-only relative to the requested valid time. A 15-minute
+    lookback keeps the objective analysis tightly aligned with model valid time.
     """
     valid_time = pd.Timestamp(valid_time)
     if valid_time.tzinfo is None:

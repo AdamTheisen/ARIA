@@ -264,18 +264,20 @@ class SurfaceAnalysisBuilder:
         tree = cKDTree(points)
 
         k_use = min(max(int(self.config.kernel_k), int(min_neighbors)), n_valid)
+        # Query the nearest bounded set of stations everywhere, then apply the
+        # support radius using distance to the *nearest* observation.  Applying
+        # distance_upper_bound to every neighbor created visible circular lobes
+        # and discontinuities in sparse networks (especially Storm Explorer).
+        # Gaussian/Barnes weights already decay distant stations smoothly.
         distance, index = tree.query(
             targets,
             k=k_use,
-            distance_upper_bound=float(max_distance_km),
             workers=-1,
         )
         if k_use == 1:
             distance = distance[:, None]
             index = index[:, None]
 
-        # scipy returns index == n_valid for missing neighbors when an upper
-        # distance bound is supplied. Map those to a safe slot and zero weight.
         missing = (~np.isfinite(distance)) | (index >= n_valid)
         safe_index = np.where(missing, 0, index)
         neighbor_values = values[safe_index]
@@ -296,7 +298,13 @@ class SurfaceAnalysisBuilder:
         den = np.sum(weights, axis=1)
         num = np.sum(weights * neighbor_values, axis=1)
 
-        good = (den > 0.0) & (n >= int(min_neighbors))
+        nearest_raw = np.min(distance, axis=1)
+        good = (
+            (den > 0.0)
+            & (n >= int(min_neighbors))
+            & np.isfinite(nearest_raw)
+            & (nearest_raw <= float(max_distance_km))
+        )
         out = np.full(len(targets), np.nan)
         out[good] = num[good] / den[good]
 
@@ -304,7 +312,7 @@ class SurfaceAnalysisBuilder:
         age_num = np.sum(weights * neighbor_ages, axis=1)
         age[good] = age_num[good] / den[good]
 
-        nearest = np.min(distance, axis=1)
+        nearest = nearest_raw.copy()
         nearest[~good] = np.nan
 
         return (

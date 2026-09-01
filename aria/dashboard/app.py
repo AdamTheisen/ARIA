@@ -6,6 +6,9 @@ import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
 from aria import GPGL_REGION, REGION_PRESETS, Region, __version__
+from aria.region import region_from_dict
+from aria.region_store import load_saved_regions, save_region, delete_region
+from aria.region_stats import region_inventory
 from aria.adapters.nexrad import GPGL_NEXRAD_SITES, nexrad_sites_for_region
 from aria.adapters.mrms import invalidate_latest_mrms_cache
 from aria.cache import PersistentCache, time_bucket
@@ -24,6 +27,7 @@ from aria.plotting import (
     plot_profile_comparison,
     plot_interactive_three_panel,
     plot_interactive_field,
+    mpl_to_plotly_colorscale,
     plot_adapt_storm_objects,
     plot_nexrad_ppi,
     plot_regional_reflectivity,
@@ -60,51 +64,155 @@ st.sidebar.caption(f"ARIA v{__version__}")
 
 
 
-st.sidebar.markdown("### Region")
-_region_choice = st.sidebar.selectbox(
-    "Analysis region", list(REGION_PRESETS) + ["Custom"], index=0,
-)
-
-if _region_choice == "Custom":
-    _region_mode = st.sidebar.radio(
-        "Region definition",
-        ["Center + radius", "Bounding box"],
-        horizontal=True,
-        key="custom-region-mode",
+def _region_preview(region, inventory=None):
+    import plotly.graph_objects as go
+    fig = go.Figure()
+    inventory = inventory or {}
+    styles = (
+        ("surface", "Surface stations", "circle"),
+        ("radars", "NEXRAD", "diamond"),
+        ("sondes", "Radiosondes", "triangle-up"),
     )
-    if _region_mode == "Center + radius":
-        c_lat = st.sidebar.number_input("Center latitude", value=44.0, step=0.25, format="%.3f")
-        c_lon = st.sidebar.number_input("Center longitude", value=-95.0, step=0.25, format="%.3f")
-        c_radius = st.sidebar.slider("Radius (km)", 50.0, 1000.0, 400.0, 25.0)
-        ACTIVE_REGION = Region.from_center_radius(
-            "Custom", c_lat, c_lon, c_radius
-        )
-        st.sidebar.caption(f"Site-centered domain • {c_radius:.0f} km radius")
-    else:
-        cwest = st.sidebar.number_input("West longitude", value=-104.1, step=0.5, format="%.2f")
-        ceast = st.sidebar.number_input("East longitude", value=-86.7, step=0.5, format="%.2f")
-        csouth = st.sidebar.number_input("South latitude", value=36.9, step=0.5, format="%.2f")
-        cnorth = st.sidebar.number_input("North latitude", value=49.1, step=0.5, format="%.2f")
-        ACTIVE_REGION = Region(
-            name="Custom", west=cwest, east=ceast, south=csouth, north=cnorth
-        )
-else:
-    ACTIVE_REGION = REGION_PRESETS[_region_choice]
+    for key, label, symbol in styles:
+        rows = [r for r in inventory.get(key, []) if r.get("latitude") is not None and r.get("longitude") is not None]
+        if not rows:
+            continue
+        fig.add_trace(go.Scattergeo(
+            lon=[r["longitude"] for r in rows], lat=[r["latitude"] for r in rows],
+            text=[r.get("id", "") for r in rows], name=label, mode="markers",
+            marker=dict(size=7 if key == "surface" else 10, symbol=symbol),
+            hovertemplate="%{text}<br>%{lat:.2f}, %{lon:.2f}<extra></extra>",
+        ))
+    fig.update_geos(
+        projection_type="mercator", showland=True, showcountries=True, showsubunits=True,
+        lonaxis_range=[region.west, region.east], lataxis_range=[region.south, region.north],
+        fitbounds=False,
+    )
+    fig.update_layout(height=470, margin=dict(l=0, r=0, t=15, b=0), legend=dict(orientation="h"))
+    return fig
 
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _inventory_for_region(name, west, south, east, north):
+    region = Region(name=name, west=west, south=south, east=east, north=north)
+    return region_inventory(region)
+
+
+def _show_region_configuration():
+    st.subheader("Region Configuration")
+    st.caption("Define the analysis domain, inspect observing-system coverage, and launch ARIA. Built-in regions are read-only; duplicate one with a new name to customize it.")
+
+    saved = load_saved_regions()
+    choices = list(REGION_PRESETS) + sorted(saved) + ["New Region"]
+    choice = st.selectbox("Region", choices, index=0, key="region-config-choice")
+    source = REGION_PRESETS.get(choice) or saved.get(choice)
+
+    if st.session_state.get("_region_config_source") != choice:
+        st.session_state["_region_config_source"] = choice
+        if source is not None:
+            st.session_state["cfg_name"] = source.name
+            st.session_state["cfg_west"] = float(source.west)
+            st.session_state["cfg_east"] = float(source.east)
+            st.session_state["cfg_south"] = float(source.south)
+            st.session_state["cfg_north"] = float(source.north)
+            st.session_state["cfg_center_lat"] = (source.south + source.north) / 2.0
+            st.session_state["cfg_center_lon"] = (source.west + source.east) / 2.0
+            st.session_state["cfg_radius"] = max(50.0, (source.north-source.south)*111.0/2.0)
+        else:
+            st.session_state["cfg_name"] = "My Region"
+            st.session_state["cfg_center_lat"] = 40.0
+            st.session_state["cfg_center_lon"] = -97.0
+            st.session_state["cfg_radius"] = 400.0
+            st.session_state["cfg_west"] = -102.0
+            st.session_state["cfg_east"] = -92.0
+            st.session_state["cfg_south"] = 35.0
+            st.session_state["cfg_north"] = 45.0
+
+    built_in = choice in REGION_PRESETS
+    mode = st.radio("Region definition", ["Bounding box", "Center + radius"], horizontal=True, key="cfg_mode")
+    name = st.text_input("Region name", key="cfg_name", disabled=built_in)
+
+    if mode == "Center + radius":
+        c1,c2,c3 = st.columns(3)
+        lat = c1.number_input("Center latitude", -90.0, 90.0, key="cfg_center_lat", format="%.3f", disabled=built_in)
+        lon = c2.number_input("Center longitude", -180.0, 180.0, key="cfg_center_lon", format="%.3f", disabled=built_in)
+        radius = c3.number_input("Radius (km)", 25.0, 2500.0, key="cfg_radius", step=25.0, disabled=built_in)
+        candidate = Region.from_center_radius(name or "Custom", lat, lon, radius)
+    else:
+        c1,c2,c3,c4 = st.columns(4)
+        west = c1.number_input("West", -180.0, 180.0, key="cfg_west", format="%.3f", disabled=built_in)
+        east = c2.number_input("East", -180.0, 180.0, key="cfg_east", format="%.3f", disabled=built_in)
+        south = c3.number_input("South", -90.0, 90.0, key="cfg_south", format="%.3f", disabled=built_in)
+        north = c4.number_input("North", -90.0, 90.0, key="cfg_north", format="%.3f", disabled=built_in)
+        candidate = source if built_in else Region(name=name or "Custom", west=west, east=east, south=south, north=north)
+
+    if built_in:
+        candidate = source
+
+    with st.spinner("Discovering stations and radars in this region..."):
+        inv = _inventory_for_region(candidate.name, candidate.west, candidate.south, candidate.east, candidate.north)
+
+    m1,m2,m3,m4 = st.columns(4)
+    m1.metric("Surface stations", len(inv["surface"]), help=f"Stations reporting during the last {inv['surface_minutes']} minutes")
+    m2.metric("NEXRAD radars", len(inv["radars"]), help="Operational sites returned by ARIA/Py-ART regional discovery")
+    m3.metric("Radiosonde sites", len(inv["sondes"]), help="IEM RAOB launch sites inside the region")
+    m4.metric("States queried", len(candidate.query_states))
+
+    st.plotly_chart(_region_preview(candidate, inv), use_container_width=True, config={"displaylogo":False})
+
+    errors = {k:v for k,v in inv.get("errors",{}).items() if v}
+    if errors:
+        st.warning("Some inventory sources could not be queried: " + "; ".join(f"{k}: {v}" for k,v in errors.items()))
+
+    with st.expander("Observing sites"):
+        t1,t2,t3 = st.tabs(["Surface", "NEXRAD", "Radiosondes"])
+        with t1: st.dataframe(pd.DataFrame(inv["surface"]), use_container_width=True, hide_index=True)
+        with t2: st.dataframe(pd.DataFrame(inv["radars"]), use_container_width=True, hide_index=True)
+        with t3: st.dataframe(pd.DataFrame(inv["sondes"]), use_container_width=True, hide_index=True)
+
+    b1,b2,b3,b4 = st.columns([1,1,1,3])
+    if b1.button("Launch ARIA", type="primary", use_container_width=True):
+        st.session_state["aria_active_region"] = candidate.as_dict()
+        st.session_state["aria_region_config_open"] = False
+        st.rerun()
+    if not built_in and b2.button("Save region", use_container_width=True):
+        if not name.strip():
+            st.error("Enter a region name before saving.")
+        else:
+            save_region(candidate)
+            st.success(f"Saved {candidate.name}.")
+            st.rerun()
+    if choice in saved and b3.button("Delete region", use_container_width=True):
+        delete_region(choice)
+        st.session_state.pop("_region_config_source", None)
+        st.success(f"Deleted {choice}.")
+        st.rerun()
+
+
+if "aria_region_config_open" not in st.session_state:
+    st.session_state["aria_region_config_open"] = True
+
+if st.session_state["aria_region_config_open"]:
+    _show_region_configuration()
+    st.stop()
+
+ACTIVE_REGION = region_from_dict(st.session_state.get("aria_active_region", GPGL_REGION.as_dict()))
 REGION_CACHE_KEY = ACTIVE_REGION.cache_key
 _region_changed = st.session_state.get("_aria_region_key") != REGION_CACHE_KEY
 if _region_changed:
     st.session_state["_aria_region_key"] = REGION_CACHE_KEY
-    # Streamlit caches do not automatically include globals such as ACTIVE_REGION
-    # in their cache key. Clearing on region change prevents one region's in-memory
-    # result from being returned for another region.
     st.cache_data.clear()
     st.cache_resource.clear()
 
+st.sidebar.markdown("### Region")
+st.sidebar.markdown(f"**{ACTIVE_REGION.name}**")
 st.sidebar.caption(
     f"{ACTIVE_REGION.west:.1f}° to {ACTIVE_REGION.east:.1f}° lon • "
     f"{ACTIVE_REGION.south:.1f}° to {ACTIVE_REGION.north:.1f}° lat"
 )
+if st.sidebar.button("Change region", use_container_width=True):
+    st.session_state["aria_region_config_open"] = True
+    st.rerun()
 
 @st.cache_resource
 def processed_cache():
@@ -423,7 +531,7 @@ if view in ("Surface","Coverage"):
         cmap,vmin,vmax=color_controls("Temperature","coolwarm",surface.air_temperature_f.values)
         if st.sidebar.checkbox("Interactive map",True,key="surface-interactive"):
             fig=plot_interactive_field(surface.air_temperature_f.isel(time=idx),ACTIVE_REGION,
-                title="Surface Air Temperature",units="°F",zmin=vmin,zmax=vmax,colorscale="RdBu_r")
+                title="Surface Air Temperature",units="°F",zmin=vmin,zmax=vmax,colorscale=mpl_to_plotly_colorscale(cmap))
             fig.update_layout(height=max(fig.layout.height or 0, 760)); st.plotly_chart(fig,use_container_width=True)
             st.caption("Hover to inspect values; pan/box/scroll zoom to explore.")
         else:
@@ -938,11 +1046,12 @@ elif view=="Model":
                                     sonde_variable,None
                                 )
                                 if match_info:
-                                    c1,c2,c3,c4=st.columns(4)
+                                    c1,c2,c3,c4,c5=st.columns(5)
                                     c1.metric("Sonde launch",pd.Timestamp(match_info["sonde_time"]).strftime("%Y-%m-%d %H:%M UTC"))
                                     c2.metric("HRRR init",pd.Timestamp(match_info["hrrr_initialization"]).strftime("%Y-%m-%d %H:%M UTC"))
                                     c3.metric("Forecast",f'F{int(match_info["forecast_hour"]):02d}')
-                                    c4.metric("Time offset",f'{match_info["offset_minutes"]:+.0f} min')
+                                    c4.metric("HRRR valid",pd.Timestamp(match_info["hrrr_valid_time"]).strftime("%Y-%m-%d %H:%M UTC"))
+                                    c5.metric("Time offset",f'{match_info["offset_minutes"]:+.0f} min')
                             else:
                                 _,_,profiles,station_id,profile_comp=load_hrrr_raob_comparison(REGION_CACHE_KEY, 
                                     pd.Timestamp(cycle).isoformat(),
@@ -1050,7 +1159,10 @@ elif view=="Storm Explorer":
                 ),
             )
             fig.update_layout(height=max(fig.layout.height or 0, 760)); st.plotly_chart(fig,use_container_width=True)
-            st.caption("Pan or box/scroll zoom on any panel; Model, Observation, and Difference use synchronized geographic axes.")
+            st.caption(
+                "Surface observations use a 15-minute past-only window ending at the HRRR valid time. "
+                "Pan or box/scroll zoom on any panel; Model, Observation, and Difference use synchronized geographic axes."
+            )
 
             diff=comparison.difference.values
             finite=diff[np.isfinite(diff)]

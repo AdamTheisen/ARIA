@@ -138,38 +138,46 @@ class Region:
             & (longitude >= self.west) & (longitude <= self.east)
         )
 
-
-@classmethod
-def from_center_radius(cls, name, center_lat, center_lon, radius_km, **kwargs):
-    """Build a rectangular query region around a center point and radius.
-
-    The rectangle fully contains the requested circular radius. This keeps
-    provider queries simple while exposing a more natural site-centered
-    definition to ARIA users.
-    """
-    center_lat = float(center_lat)
-    center_lon = float(center_lon)
-    radius_km = float(radius_km)
-    if radius_km <= 0:
-        raise ValueError("radius_km must be positive.")
-    lat_delta = radius_km / 111.0
-    coslat = max(math.cos(math.radians(center_lat)), 0.15)
-    lon_delta = radius_km / (111.0 * coslat)
-    return cls(
-        name=name,
-        west=center_lon - lon_delta,
-        east=center_lon + lon_delta,
-        south=center_lat - lat_delta,
-        north=center_lat + lat_delta,
+    @classmethod
+    def from_center_radius(
+        cls,
+        name,
+        center_lat,
+        center_lon,
+        radius_km,
         **kwargs,
-    )
+    ):
+        """Build a bounding-box Region around a center point and radius."""
+        center_lat = float(center_lat)
+        center_lon = float(center_lon)
+        radius_km = float(radius_km)
+
+        if radius_km <= 0:
+            raise ValueError("radius_km must be positive.")
+
+        lat_delta = radius_km / 111.0
+        coslat = max(math.cos(math.radians(center_lat)), 0.15)
+        lon_delta = radius_km / (111.0 * coslat)
+
+        return cls(
+            name=name,
+            west=center_lon - lon_delta,
+            east=center_lon + lon_delta,
+            south=center_lat - lat_delta,
+            north=center_lat + lat_delta,
+            **kwargs,
+        )
 
     def as_dict(self):
         return {
-            "name": self.name, "west": self.west, "south": self.south,
-            "east": self.east, "north": self.north,
+            "name": self.name,
+            "west": self.west,
+            "south": self.south,
+            "east": self.east,
+            "north": self.north,
             "query_states": list(self.query_states),
         }
+
 
 GPGL_REGION = Region(
     name="GPGL", west=-104.1, south=36.9, east=-86.7, north=49.1,
