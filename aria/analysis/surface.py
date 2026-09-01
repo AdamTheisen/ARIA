@@ -20,8 +20,11 @@ class SurfaceAnalysisConfig:
     """
 
     analysis_interval: str = "5min"
-    lookback: str = "15min"
-    temporal_decay_minutes: float = 7.5
+    lookback: str = "30min"
+    temporal_decay_minutes: float = 15.0
+    # "past" keeps only observations at/before analysis time.
+    # "nearest" chooses the closest observation on either side of analysis time.
+    observation_match_mode: str = "past"
 
     method: str = "barnes"
     smoothing_km: float = 140.0
@@ -94,21 +97,36 @@ class SurfaceAnalysisBuilder:
             analysis_time = analysis_time.tz_convert("UTC")
 
         lookback = pd.Timedelta(self.config.lookback)
+        mode = str(getattr(self.config, "observation_match_mode", "past")).lower()
 
-        work = work[
-            (work["time"] <= analysis_time)
-            & (work["time"] >= analysis_time - lookback)
-        ].copy()
-
-        if work.empty:
-            return work
-
-        work["observation_age_minutes"] = (
-            analysis_time - work["time"]
-        ).dt.total_seconds() / 60.0
+        if mode == "nearest":
+            work["observation_offset_minutes"] = (
+                work["time"] - analysis_time
+            ).dt.total_seconds() / 60.0
+            work = work[
+                work["observation_offset_minutes"].abs()
+                <= lookback.total_seconds() / 60.0
+            ].copy()
+            if work.empty:
+                return work
+            # Temporal weighting uses absolute separation from valid time.
+            work["observation_age_minutes"] = work["observation_offset_minutes"].abs()
+            sort_column = "observation_age_minutes"
+        else:
+            work = work[
+                (work["time"] <= analysis_time)
+                & (work["time"] >= analysis_time - lookback)
+            ].copy()
+            if work.empty:
+                return work
+            work["observation_offset_minutes"] = (
+                work["time"] - analysis_time
+            ).dt.total_seconds() / 60.0
+            work["observation_age_minutes"] = -work["observation_offset_minutes"]
+            sort_column = "observation_age_minutes"
 
         return (
-            work.sort_values("observation_age_minutes")
+            work.sort_values(sort_column)
             .drop_duplicates(
                 subset=["station_id", "variable"],
                 keep="first",

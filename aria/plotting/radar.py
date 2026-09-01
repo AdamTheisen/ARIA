@@ -32,6 +32,8 @@ def plot_nexrad_ppi(
     vmin=-10,
     vmax=70,
     cmap="pyart_NWSRef",
+    adapt_labels=None,
+    show_adapt_ids=True,
 ):
     """
     Plot one NEXRAD reflectivity PPI sweep using Py-ART.
@@ -73,6 +75,39 @@ def plot_nexrad_ppi(
         colorbar_label="Reflectivity (dBZ)",
         title_flag=False,
     )
+
+    if adapt_labels is not None:
+        try:
+            import cartopy.crs as ccrs
+            labels = np.asarray(adapt_labels)
+            gate_lat, gate_lon, _ = radar.get_gate_lat_lon_alt(sweep)
+            if labels.shape == gate_lat.shape and np.nanmax(labels) > 0:
+                levels = np.arange(0.5, int(np.nanmax(labels)) + 0.5, 1.0)
+                ax.contour(
+                    gate_lon, gate_lat, labels,
+                    levels=levels,
+                    colors="white",
+                    linewidths=1.4,
+                    transform=ccrs.PlateCarree(),
+                )
+                if show_adapt_ids:
+                    for object_id in range(1, int(np.nanmax(labels)) + 1):
+                        mask = labels == object_id
+                        if not np.any(mask):
+                            continue
+                        lon0 = float(np.nanmean(gate_lon[mask]))
+                        lat0 = float(np.nanmean(gate_lat[mask]))
+                        ax.text(
+                            lon0, lat0, f"T{object_id}",
+                            transform=ccrs.PlateCarree(),
+                            ha="center", va="center",
+                            fontsize=9, fontweight="bold",
+                            color="white",
+                            bbox=dict(boxstyle="round,pad=0.18", facecolor="black", alpha=0.55, edgecolor="none"),
+                        )
+        except Exception:
+            # ADAPT overlays are optional and should never prevent the radar plot.
+            pass
 
     fixed_angle = float(
         radar.fixed_angle["data"][sweep]

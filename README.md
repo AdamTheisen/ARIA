@@ -220,3 +220,18 @@ The planned ~3-km physical surface grid is intentionally not enabled in this
 release. At regional scale it needs chunked Barnes evaluation to avoid a large
 nearest-neighbor working array; the current 0.1-degree surface grid remains the
 safe default until that performance work is completed.
+
+
+## v0.17.1
+
+- Renamed **Storm Explorer** to **Model Evaluation**.
+- Surface model/observation matching now defaults to the nearest station report
+  within **±30 minutes** of HRRR valid time, with selectable 10–60 minute
+  offsets and an optional past-only mode.
+- Replaced radar-specific navigation wording with neutral observation-target
+  terminology so Surface Evaluation no longer shows "Follow Radar" or "Radar
+  time offset" controls.
+- Added observation timing diagnostics to Surface Evaluation.
+- Added optional **ADAPT storm-cell detection** to the single-NEXRAD PPI viewer,
+  including object outlines, IDs, thresholds, minimum size, h-maxima controls,
+  and an object inventory.

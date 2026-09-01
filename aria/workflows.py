@@ -570,12 +570,15 @@ def build_surface_at_valid_time(
     valid_time,
     *,
     region=GPGL_REGION,
-    lookback="15min",
+    lookback="30min",
+    observation_match_mode="nearest",
 ):
     """
     Build one regional surface analysis at a requested model valid time.
-    Observations are past-only relative to the requested valid time. A 15-minute
-    lookback keeps the objective analysis tightly aligned with model valid time.
+
+    ``lookback`` is the maximum allowed time separation. ``nearest`` (default)
+    selects the closest observation from each station on either side of valid
+    time; ``past`` restricts matching to observations at/before valid time.
     """
     valid_time = pd.Timestamp(valid_time)
     if valid_time.tzinfo is None:
@@ -583,10 +586,12 @@ def build_surface_at_valid_time(
     else:
         valid_time = valid_time.tz_convert("UTC")
 
+    offset = pd.Timedelta(lookback)
+    match_mode = str(observation_match_mode).lower()
     observations = fetch_asos_tidy(
         region,
-        start=valid_time - pd.Timedelta(lookback),
-        end=valid_time,
+        start=valid_time - offset,
+        end=valid_time + offset if match_mode == "nearest" else valid_time,
     )
 
     grid = GridSpec(
@@ -599,7 +604,8 @@ def build_surface_at_valid_time(
     config = SurfaceAnalysisConfig(
         analysis_interval="5min",
         lookback=lookback,
-        temporal_decay_minutes=7.5,
+        temporal_decay_minutes=max(7.5, pd.Timedelta(lookback).total_seconds() / 120.0),
+        observation_match_mode=match_mode,
         method="barnes",
         smoothing_km=140.0,
         max_distance_km=250.0,
@@ -674,6 +680,8 @@ def build_hrrr_surface_gridded_comparison(
     cycle=None,
     forecast_hour=0,
     variable="air_temperature_2m",
+    observation_offset_minutes=30,
+    observation_match_mode="nearest",
 ):
     from .integrated import build_surface_difference
 
@@ -686,6 +694,8 @@ def build_hrrr_surface_gridded_comparison(
     surface, observations = build_surface_at_valid_time(
         run.valid_time,
         region=region,
+        lookback=f"{int(observation_offset_minutes)}min",
+        observation_match_mode=observation_match_mode,
     )
     comparison = build_surface_difference(
         model,

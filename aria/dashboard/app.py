@@ -2,6 +2,7 @@ from __future__ import annotations
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import xarray as xr
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
@@ -12,7 +13,7 @@ from aria.region_stats import region_inventory
 from aria.adapters.nexrad import GPGL_NEXRAD_SITES, nexrad_sites_for_region
 from aria.adapters.mrms import invalidate_latest_mrms_cache
 from aria.cache import PersistentCache, time_bucket
-from aria.storm_objects import adapt_available, adapt_version
+from aria.storm_objects import adapt_available, adapt_version, segment_with_adapt, summarize_objects
 from aria.plotting import (
     VARIABLE_STYLE,
     MODEL_STYLE,
@@ -330,12 +331,20 @@ def load_hrrr_asos_comparison(region_key, cycle_iso, forecast_hour, variable):
             cycle=pd.Timestamp(cycle_iso),
             forecast_hour=forecast_hour,
             variable=variable,
+            observation_offset_minutes=observation_offset_minutes,
+            observation_match_mode=observation_match_mode,
         ),
     )
 
 @st.cache_data(ttl=1800,show_spinner=False)
-def load_hrrr_gridded_comparison(region_key, cycle_iso, forecast_hour, variable):
-    key=f"{cycle_iso}-f{int(forecast_hour):02d}-{variable}-surface-grid"
+def load_hrrr_gridded_comparison(
+    region_key, cycle_iso, forecast_hour, variable,
+    observation_offset_minutes=30, observation_match_mode="nearest",
+):
+    key=(
+        f"{cycle_iso}-f{int(forecast_hour):02d}-{variable}-surface-grid"
+        f"-obs{int(observation_offset_minutes)}-{observation_match_mode}"
+    )
     return disk_cached(
         "comparisons",
         key,
@@ -467,8 +476,8 @@ def load_latest_hrrr_raob(region_key, variable, station_id=None):
         ),
     )
 
-view=st.sidebar.radio("View",["Surface","Air Quality","Radar","Regional Radar","Model","Storm Explorer","3-D Atmosphere","Atmosphere Slice","Coverage"])
-refresh_minutes={"Surface":5,"Air Quality":30,"Radar":5,"Regional Radar":5,"Model":30,"Storm Explorer":5,"3-D Atmosphere":60,"Atmosphere Slice":60,"Coverage":5}[view]
+view=st.sidebar.radio("View",["Surface","Air Quality","Radar","Regional Radar","Model","Model Evaluation","3-D Atmosphere","Atmosphere Slice","Coverage"])
+refresh_minutes={"Surface":5,"Air Quality":30,"Radar":5,"Regional Radar":5,"Model":30,"Model Evaluation":5,"3-D Atmosphere":60,"Atmosphere Slice":60,"Coverage":5}[view]
 auto=st.sidebar.toggle("Auto-update",value=True)
 if auto:
     st_autorefresh(interval=refresh_minutes*60*1000,key=f"auto-{view}")
@@ -577,8 +586,48 @@ elif view=="Radar":
             sweeps=radar_sweep_summary(radar); sw=st.sidebar.selectbox("Elevation sweep",sweeps.sweep.tolist(),
                 format_func=lambda s:f"Sweep {s} — {sweeps.loc[sweeps.sweep==s,'elevation_deg'].iloc[0]:.1f}°")
             cmap,vmin,vmax=color_controls("Reflectivity","turbo",np.array([]),-30,70)
-            fig=plot_nexrad_ppi(radar,sweep=sw,cmap=cmap,vmin=-30 if vmin is None else vmin,vmax=70 if vmax is None else vmax)
+            adapt_labels=None
+            if adapt_available():
+                use_adapt=st.sidebar.checkbox("ADAPT storm-cell detection",value=False,key="radar-adapt-enable")
+                if use_adapt:
+                    adapt_threshold=st.sidebar.slider("ADAPT threshold (dBZ)",20.0,60.0,35.0,1.0,key="radar-adapt-threshold")
+                    adapt_min_points=st.sidebar.slider("ADAPT minimum grid points",1,100,8,1,key="radar-adapt-minpoints")
+                    adapt_hmax=st.sidebar.slider("ADAPT h-maxima (dBZ)",1.0,15.0,5.0,1.0,key="radar-adapt-hmax")
+                    field_name=next((n for n in ("reflectivity","corrected_reflectivity","reflectivity_horizontal") if n in radar.fields),None)
+                    if field_name is not None:
+                        ray0=int(radar.sweep_start_ray_index["data"][sw])
+                        ray1=int(radar.sweep_end_ray_index["data"][sw])+1
+                        sweep_field=np.asarray(np.ma.filled(radar.fields[field_name]["data"][ray0:ray1,:],np.nan),dtype=float)
+                        da=xr.DataArray(
+                            sweep_field,
+                            dims=("y","x"),
+                            coords={"y":np.arange(sweep_field.shape[0]),"x":np.arange(sweep_field.shape[1])},
+                            name="reflectivity",
+                        )
+                        try:
+                            adapt_labels=segment_with_adapt(
+                                da,
+                                threshold_dbz=adapt_threshold,
+                                min_gridpoints=adapt_min_points,
+                                h_maxima_dbz=adapt_hmax,
+                            )
+                        except Exception as exc:
+                            st.warning(f"ADAPT segmentation could not be applied to this sweep: {exc}")
+            else:
+                st.sidebar.caption("ADAPT is not installed; storm-cell detection is unavailable.")
+
+            fig=plot_nexrad_ppi(
+                radar,sweep=sw,cmap=cmap,
+                vmin=-30 if vmin is None else vmin,
+                vmax=70 if vmax is None else vmax,
+                adapt_labels=adapt_labels,
+            )
             st.pyplot(fig,use_container_width=True); plt.close(fig)
+            if adapt_labels is not None:
+                objects=summarize_objects(adapt_labels,da)
+                st.caption(f"ADAPT {adapt_version() or ''} detected {len(objects)} storm cells on sweep {sw}. White outlines and T# labels show detected objects.")
+                if len(objects):
+                    st.dataframe(objects,use_container_width=True,hide_index=True)
         else:
             dx=st.sidebar.selectbox("3-D grid spacing",[4.0,2.0,1.0],index=1,format_func=lambda v:f"{v:g} km")
             max_range=st.sidebar.slider("3-D range (km)",75.0,230.0,180.0,25.0)
@@ -1092,8 +1141,8 @@ elif view=="Model":
                 )
 
 
-elif view=="Storm Explorer":
-    st.subheader("Storm Explorer")
+elif view=="Model Evaluation":
+    st.subheader("Model Evaluation")
     st.caption(
         "Synchronize HRRR and observations by valid time. This view is designed "
         "for event analysis rather than simply showing the newest available layer."
@@ -1106,9 +1155,16 @@ elif view=="Storm Explorer":
         radar_anchor=radar_anchor.tz_localize("UTC") if radar_anchor.tzinfo is None else radar_anchor.tz_convert("UTC")
     except Exception:
         radar_anchor=now_utc.floor("5min")
-    timing_mode=st.sidebar.radio("Digital Storm navigation",["Follow Radar","Compare Forecast Runs"],key="storm-nav-mode")
-    radar_step=st.sidebar.number_input("Radar time offset (minutes)",min_value=-720,max_value=0,value=0,step=5,key="storm-radar-offset")
-    target_radar_time=radar_anchor+pd.Timedelta(minutes=int(radar_step))
+    timing_mode=st.sidebar.radio(
+        "Evaluation navigation",
+        ["Latest observations","Compare Forecast Runs"],
+        key="storm-nav-mode",
+    )
+    observation_step=st.sidebar.number_input(
+        "Observation target offset (minutes)",
+        min_value=-720,max_value=0,value=0,step=5,key="storm-observation-offset",
+    )
+    target_radar_time=radar_anchor+pd.Timedelta(minutes=int(observation_step))
     cycles=hrrr_available_cycles(count=24)
     run_back=st.sidebar.slider("Previous HRRR runs",0,17,0,1,key="storm-run-back") if timing_mode=="Compare Forecast Runs" else 0
     candidates=[]
@@ -1125,18 +1181,35 @@ elif view=="Storm Explorer":
     valid_time=pd.Timestamp(cycle)+pd.Timedelta(hours=int(fxx))
     c1,c2,c3,c4=st.columns(4)
     c1.metric("Current UTC",now_utc.strftime("%Y-%m-%d %H:%M UTC"))
-    c2.metric("MRMS target",target_radar_time.strftime("%Y-%m-%d %H:%M UTC"),f"{(target_radar_time-now_utc).total_seconds()/60:+.0f} min")
+    c2.metric("Observation target",target_radar_time.strftime("%Y-%m-%d %H:%M UTC"),f"{(target_radar_time-now_utc).total_seconds()/60:+.0f} min")
     c3.metric("HRRR run",pd.Timestamp(cycle).strftime("%Y-%m-%d %H:%M UTC"),f"F{int(fxx):02d}")
-    c4.metric("HRRR valid",valid_time.strftime("%Y-%m-%d %H:%M UTC"),f"{(valid_time-target_radar_time).total_seconds()/60:+.0f} min vs radar")
+    c4.metric("HRRR valid",valid_time.strftime("%Y-%m-%d %H:%M UTC"),f"{(valid_time-target_radar_time).total_seconds()/60:+.0f} min vs obs target")
     mrms_age_min=(now_utc-target_radar_time).total_seconds()/60
     if mrms_age_min > 15:
         st.warning(f"MRMS data are stale: {mrms_age_min:.0f} minutes old.")
-    st.caption("Follow Radar steps the observation target and automatically aligns HRRR. Compare Forecast Runs holds the radar target and steps backward through model initializations while adjusting Fxx.")
+    st.caption("Latest observations aligns HRRR to the selected observation target. Compare Forecast Runs holds the observation target fixed while stepping backward through model initializations and adjusting Fxx.")
     surface_tab,radar_tab,lead_tab,objects_tab=st.tabs(
         ["Surface comparison","Radar comparison","Lead-time verification","Storm objects (ADAPT)"]
     )
 
     with surface_tab:
+        sc1,sc2=st.columns(2)
+        with sc1:
+            surface_obs_offset=st.selectbox(
+                "Maximum surface observation offset",
+                [10,15,20,30,45,60],
+                index=3,
+                format_func=lambda v:f"{v} minutes",
+                key="surface-observation-offset",
+            )
+        with sc2:
+            surface_match_label=st.radio(
+                "Surface observation matching",
+                ["Nearest ± offset","Past-only"],
+                horizontal=True,
+                key="surface-observation-match-mode",
+            )
+        surface_match_mode="nearest" if surface_match_label.startswith("Nearest") else "past"
         surface_variable=st.selectbox(
             "Surface variable",
             ["air_temperature_2m","dew_point_temperature_2m"],
@@ -1149,6 +1222,8 @@ elif view=="Storm Explorer":
                     pd.Timestamp(cycle).isoformat(),
                     fxx,
                     surface_variable,
+                    surface_obs_offset,
+                    surface_match_mode,
                 )
             fig=plot_interactive_three_panel(
                 comparison,
@@ -1160,7 +1235,7 @@ elif view=="Storm Explorer":
             )
             fig.update_layout(height=max(fig.layout.height or 0, 760)); st.plotly_chart(fig,use_container_width=True)
             st.caption(
-                "Surface observations use a 15-minute past-only window ending at the HRRR valid time. "
+                f"Surface observations use the closest report within {'±' if surface_match_mode == 'nearest' else 'the preceding '}{surface_obs_offset} minutes of HRRR valid time. "
                 "Pan or box/scroll zoom on any panel; Model, Observation, and Difference use synchronized geographic axes."
             )
 
@@ -1170,6 +1245,15 @@ elif view=="Storm Explorer":
             m1.metric("ASOS observations",len(observations))
             m2.metric("Mean bias",f"{np.nanmean(finite):.2f} {comparison.attrs.get('units','')}" if finite.size else "—")
             m3.metric("Grid RMSE",f"{np.sqrt(np.nanmean(finite**2)):.2f} {comparison.attrs.get('units','')}" if finite.size else "—")
+            if len(observations):
+                obs_times=pd.to_datetime(observations["time"],utc=True,errors="coerce").dropna()
+                if len(obs_times):
+                    offsets=(obs_times-pd.Timestamp(run.valid_time)).dt.total_seconds()/60.0
+                    st.caption(
+                        f"Observation reports retrieved: {obs_times.min():%H:%M}–{obs_times.max():%H:%M} UTC • "
+                        f"median absolute offset {offsets.abs().median():.0f} min • "
+                        f"maximum absolute offset {offsets.abs().max():.0f} min"
+                    )
 
     with radar_tab:
         reflectivity_variable=st.selectbox(
