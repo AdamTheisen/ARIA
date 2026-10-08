@@ -29,3 +29,21 @@ recipe execution can use the same region definition without Streamlit.
 ARIA v0.16.2 uses `aria/` as the actual Python source package. The earlier
 `gpgl_data_hub/` compatibility layout has been removed before the first GitHub
 release so the repository starts with the intended long-term project structure.
+
+
+## v0.20 persistent ARCO storage
+
+The persistent data path is distinct from ARIA's disposable download/processed
+cache. Xarray scientific products use transactional Icechunk/Zarr v3 stores,
+while tables use Parquet. Each region owns independent observations, analyses,
+models, and derived-product namespaces.
+
+Dashboard reads are local-first: a current persistent dataset is used before
+ARIA contacts the upstream source. The background collector and dashboard use
+the same storage API.
+
+### Reflectivity gridding policy
+
+Reflectivity is logarithmic. ARIA therefore converts dBZ to linear Z before any
+quantitative spatial interpolation or Barnes aggregation, then converts the
+result back to dBZ for display, thresholds, differences, and verification.

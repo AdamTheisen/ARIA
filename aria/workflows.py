@@ -33,10 +33,8 @@ def fetch_asos_tidy(
         start - pd.Timedelta(minutes=15),
         end,
         variables=[
-            "tmpf",
-            "dwpf",
-            "drct",
-            "sknt",
+            "tmpf","dwpf","relh","drct","sknt","p01i","alti","mslp",
+            "vsby","gust","skyc1","skyl1","feel",
         ],
     )
 
@@ -60,6 +58,16 @@ def fetch_asos_tidy(
         for source_var, variable, units in (
             ("tmpf", "air_temperature_f", "degF"),
             ("dwpf", "dew_point_temperature_f", "degF"),
+            ("relh", "relative_humidity_pct", "%"),
+            ("sknt", "wind_speed_kt", "kt"),
+            ("drct", "wind_direction_deg", "degree"),
+            ("p01i", "precipitation_1h_in", "in"),
+            ("alti", "altimeter_inhg", "inHg"),
+            ("mslp", "sea_level_pressure_mb", "mb"),
+            ("vsby", "visibility_mi", "mi"),
+            ("gust", "wind_gust_kt", "kt"),
+            ("skyl1", "cloud_base_ft", "ft AGL"),
+            ("feel", "feels_like_f", "degF"),
         ):
             if source_var not in frame:
                 continue
@@ -77,6 +85,25 @@ def fetch_asos_tidy(
                         "variable": variable,
                         "value": float(row[source_var]),
                         "units": units,
+                    }
+                )
+
+
+        if "skyc1" in frame:
+            for _, row in frame[["time","skyc1"]].dropna().iterrows():
+                rows.append(
+                    {
+                        "source":"ASOS",
+                        "station_id":station_id,
+                        "time":row["time"],
+                        "latitude":latitude,
+                        "longitude":longitude,
+                        "variable":"sky_cover",
+                        # Keep `value` numeric for Arrow/Parquet. Categorical
+                        # observations use `text_value`.
+                        "value":np.nan,
+                        "text_value":str(row["skyc1"]),
+                        "units":"code",
                     }
                 )
 
@@ -136,7 +163,15 @@ def fetch_asos_tidy(
                     ]
                 )
 
-    return pd.DataFrame(rows)
+    out=pd.DataFrame(rows)
+    if not out.empty:
+        if "value" in out:
+            out["value"]=pd.to_numeric(out["value"],errors="coerce")
+        if "text_value" not in out:
+            out["text_value"]=pd.Series(pd.NA,index=out.index,dtype="string")
+        else:
+            out["text_value"]=out["text_value"].astype("string")
+    return out
 
 
 def build_latest_surface(
@@ -200,6 +235,15 @@ def build_latest_surface(
         variables=[
             "air_temperature_f",
             "dew_point_temperature_f",
+            "relative_humidity_pct",
+            "wind_speed_kt",
+            "precipitation_1h_in",
+            "altimeter_inhg",
+            "sea_level_pressure_mb",
+            "visibility_mi",
+            "wind_gust_kt",
+            "cloud_base_ft",
+            "feels_like_f",
             "u_wind_kt",
             "v_wind_kt",
         ],
@@ -832,12 +876,38 @@ def build_hrrr_raob_comparison(
     return model, run, profiles, station_id, comparison
 
 
+
+
+def latest_safe_hrrr_valid_time(requested=None, *, availability_lag_hours=2):
+    """Return a verification hour safely behind real-time HRRR publication.
+
+    This avoids requesting a just-started/future cycle or a cycle whose GRIB
+    subset index has not propagated yet. Historical requested times are left
+    unchanged.
+    """
+    now=pd.Timestamp.now(tz="UTC")
+    latest_safe=now.floor("1h")-pd.Timedelta(hours=int(availability_lag_hours))
+    if requested is None:
+        return latest_safe
+    target=pd.Timestamp(requested)
+    target=target.tz_localize("UTC") if target.tzinfo is None else target.tz_convert("UTC")
+    return min(target.floor("1h"), latest_safe)
+
+
+def _verification_error_message(exc):
+    message=str(exc)
+    low=message.lower()
+    if "cannot be in the future" in low or "subset index is not available yet" in low or "no index file was found" in low:
+        return "Not yet available — HRRR cycle/index publication is still pending."
+    return message
+
 def build_hrrr_lead_time_verification(
     valid_time,
     *,
     region=GPGL_REGION,
     variable="air_temperature_2m",
     forecast_hours=(0,1,3,6,12),
+    store_comparisons=False,
 ):
     """
     Compare multiple HRRR initialization cycles that verify at one common time
@@ -845,11 +915,7 @@ def build_hrrr_lead_time_verification(
     """
     from .integrated import build_surface_difference
 
-    valid_time = pd.Timestamp(valid_time)
-    if valid_time.tzinfo is None:
-        valid_time=valid_time.tz_localize("UTC")
-    else:
-        valid_time=valid_time.tz_convert("UTC")
+    valid_time = latest_safe_hrrr_valid_time(valid_time)
 
     surface, observations = build_surface_at_valid_time(
         valid_time, region=region
@@ -877,14 +943,15 @@ def build_hrrr_lead_time_verification(
                 "mae":float(np.nanmean(np.abs(d))),
                 "rmse":float(np.sqrt(np.nanmean(d**2))),
             })
-            comparisons[int(fxx)]=comp
+            if store_comparisons:
+                comparisons[int(fxx)]=comp
         except Exception as exc:
             rows.append({
                 "forecast_hour":int(fxx),
                 "initialization_time":cycle,
                 "valid_time":valid_time,
                 "bias":np.nan,"mae":np.nan,"rmse":np.nan,
-                "error":str(exc),
+                "error":_verification_error_message(exc),
             })
 
     return pd.DataFrame(rows), comparisons, surface, observations
@@ -925,17 +992,26 @@ def build_hrrr_radar_lead_time_verification(
     region=GPGL_REGION,
     model_variable="composite_reflectivity",
     forecast_hours=(0,1,3,6,12),
+    thresholds=(20,30,40),
+    store_comparisons=False,
 ):
-    """Verify multiple HRRR leads against one common MRMS QC composite field."""
+    """Verify multiple HRRR leads against one common MRMS QC composite field.
+
+    Full comparison grids are optional. Metrics-only mode is the default so
+    lead-time verification does not retain many regional grids in memory.
+    """
     from .integrated import build_radar_difference, radar_verification_metrics, radar_fractions_skill_score
-    valid_time=pd.Timestamp(valid_time)
-    valid_time=valid_time.tz_localize("UTC") if valid_time.tzinfo is None else valid_time.tz_convert("UTC")
-    radar,scan_time=build_mrms_at_time(valid_time,region=region)
+    valid_time=latest_safe_hrrr_valid_time(valid_time)
+    # HRRR cycles/valid times are hourly. Keep the observation target separate
+    # from the model clock so an MRMS time like 18:55 never produces a bogus
+    # HRRR initialization such as 15:55 for F03.
+    model_valid_time=valid_time.floor("1h")
+    radar,scan_time=build_mrms_at_time(model_valid_time,region=region)
     metric_rows=[]
     fss_rows=[]
     comparisons={}
     for fxx in forecast_hours:
-        cycle=valid_time-pd.Timedelta(hours=int(fxx))
+        cycle=model_valid_time-pd.Timedelta(hours=int(fxx))
         try:
             model,run=build_hrrr_surface(
                 region=region,
@@ -944,19 +1020,20 @@ def build_hrrr_radar_lead_time_verification(
                 variables=[model_variable],
             )
             comp=build_radar_difference(model,radar,model_variable=model_variable)
-            met=radar_verification_metrics(comp)
+            met=radar_verification_metrics(comp, thresholds=tuple(thresholds))
             met.insert(0,"forecast_hour",int(fxx))
             met.insert(1,"initialization_time",run.initialization_time)
             metric_rows.append(met)
-            fs=radar_fractions_skill_score(comp)
+            fs=radar_fractions_skill_score(comp, thresholds=tuple(thresholds))
             fs.insert(0,"forecast_hour",int(fxx))
             fss_rows.append(fs)
-            comparisons[int(fxx)]=comp
+            if store_comparisons:
+                comparisons[int(fxx)]=comp
         except Exception as exc:
             metric_rows.append(pd.DataFrame([{
                 "forecast_hour":int(fxx),"initialization_time":cycle,
                 "threshold_dbz":np.nan,"POD":np.nan,"FAR":np.nan,"CSI":np.nan,
-                "error":str(exc),
+                "error":_verification_error_message(exc),
             }]))
     metrics=pd.concat(metric_rows,ignore_index=True) if metric_rows else pd.DataFrame()
     fss=pd.concat(fss_rows,ignore_index=True) if fss_rows else pd.DataFrame()

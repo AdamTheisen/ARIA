@@ -7,6 +7,7 @@ import cartopy.feature as cfeature
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from aria.plotting.cities import add_mpl_cities
 
 
 def plot_air_quality(
@@ -63,6 +64,8 @@ def plot_air_quality(
         color="0.3",
         zorder=5,
     )
+
+    add_mpl_cities(ax, region)
 
     pm_mesh = None
 

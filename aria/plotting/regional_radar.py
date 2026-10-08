@@ -7,6 +7,7 @@ import cartopy.feature as cfeature
 import matplotlib.pyplot as plt
 import numpy as np
 from aria.plotting.state_floor import add_state_floor
+from aria.plotting.cities import add_mpl_cities
 
 
 def plot_regional_reflectivity(
@@ -15,7 +16,7 @@ def plot_regional_reflectivity(
     *,
     altitude_km=1.0,
     output_path=None,
-    vmin=-10,
+    vmin=-30,
     vmax=70,
     cmap="turbo",
 ):
@@ -62,6 +63,7 @@ def plot_regional_reflectivity(
         linewidth=0.8,
         color="white",
     )
+    add_mpl_cities(ax,region,font_size=8)
 
     cbar = fig.colorbar(
         mesh,

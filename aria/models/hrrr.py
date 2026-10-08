@@ -83,6 +83,12 @@ HRRR_SURFACE_VARIABLES = {
         "units": "1",
         "label": "Categorical Ice Pellets",
     },
+    "terrain_height": {
+        "search": ":HGT:surface",
+        "candidates": ("orog", "gh", "hgt"),
+        "units": "m",
+        "label": "Terrain Elevation",
+    },
     "surface_pressure": {
         "search": ":PRES:surface",
         "candidates": ("sp", "pres"),
@@ -230,25 +236,118 @@ class HRRRAdapter(ModelAdapter):
 
         return da
 
+    @staticmethod
+    def _is_corrupt_grib_error(exc):
+        """Return True for cfgrib/eccodes failures caused by incomplete GRIB data."""
+        names = []
+        cur = exc
+        for _ in range(5):
+            if cur is None:
+                break
+            names.append(type(cur).__name__)
+            names.append(str(cur))
+            cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
+        text = " ".join(names).lower()
+        tokens = (
+            "prematureendoffile",
+            "premature end of file",
+            "end of resource reached when reading message",
+            "no valid message found",
+            "eoferror",
+            "skipping corrupted message",
+        )
+        return any(token in text for token in tokens)
+
+    @staticmethod
+    def _purge_cached_subset(H, search):
+        """Remove only the Herbie subset associated with one field request."""
+        removed = []
+        try:
+            path = Path(H.get_localFilePath(search))
+        except Exception:
+            return removed
+
+        candidates = [path]
+        candidates.extend(path.parent.glob(path.name + "*.idx"))
+        candidates.extend(path.parent.glob(path.name + ".*.idx"))
+        candidates.append(Path(str(path) + ".idx"))
+
+        seen = set()
+        for candidate in candidates:
+            candidate = Path(candidate)
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            try:
+                if candidate.exists() and candidate.is_file():
+                    candidate.unlink()
+                    removed.append(str(candidate))
+            except Exception:
+                pass
+        return removed
+
+    @staticmethod
+    def _is_missing_index_error(exc):
+        text=f"{type(exc).__name__} {exc}".lower()
+        return (
+            "no index file was found" in text
+            or "index_as_dataframe" in text
+            or "download the full file first" in text
+        )
+
     def _open_one(self, cycle, fxx, product, meta):
         Herbie = self._herbie()
-        H = Herbie(
-            pd.Timestamp(cycle).tz_localize(None),
-            model="hrrr",
-            product=product,
-            fxx=int(fxx),
-            save_dir=self.cache_dir,
-            overwrite=False,
-            verbose=False,
-        )
 
-        ds = H.xarray(
-            meta["search"],
-            remove_grib=False,
-        )
+        def _new_herbie(overwrite=False):
+            return Herbie(
+                pd.Timestamp(cycle).tz_localize(None),
+                model="hrrr",
+                product=product,
+                fxx=int(fxx),
+                save_dir=self.cache_dir,
+                overwrite=bool(overwrite),
+                verbose=False,
+            )
+
+        H = _new_herbie(overwrite=False)
+        try:
+            ds = H.xarray(
+                meta["search"],
+                remove_grib=False,
+            )
+        except Exception as exc:
+            if self._is_missing_index_error(exc):
+                H = _new_herbie(overwrite=False)
+                try:
+                    ds = H.xarray(meta["search"], remove_grib=False)
+                except Exception as retry_exc:
+                    if self._is_missing_index_error(retry_exc):
+                        raise RuntimeError(
+                            "HRRR subset index is not available yet for this cycle/lead. "
+                            "ARIA did not download the full HRRR GRIB automatically; retry "
+                            "after the operational index is published. "
+                            f"cycle={pd.Timestamp(cycle)} f{int(fxx):02d} "
+                            f"product={product} search={meta['search']!r}"
+                        ) from retry_exc
+                    raise
+            elif self._is_corrupt_grib_error(exc):
+                self._purge_cached_subset(H, meta["search"])
+                H = _new_herbie(overwrite=True)
+                try:
+                    ds = H.xarray(meta["search"], remove_grib=False)
+                except Exception as retry_exc:
+                    if self._is_corrupt_grib_error(retry_exc):
+                        raise RuntimeError(
+                            "HRRR GRIB retrieval remained incomplete after ARIA "
+                            "removed the cached subset and retried the download. "
+                            f"cycle={pd.Timestamp(cycle)} f{int(fxx):02d} "
+                            f"product={product} search={meta['search']!r}"
+                        ) from retry_exc
+                    raise
+            else:
+                raise
 
         if isinstance(ds, list):
-            # Merge compatible hypercubes where possible.
             ds = xr.merge(ds, compat="override", join="outer")
 
         ds = self._normalize_coords(ds)

@@ -7,6 +7,83 @@ from scipy.interpolate import griddata
 from scipy.spatial import cKDTree
 
 
+
+REFLECTIVITY_FLOOR_DBZ = -30.0
+
+
+def dbz_to_linear_z(values, floor_dbz=REFLECTIVITY_FLOOR_DBZ):
+    """Convert dBZ to linear radar reflectivity factor Z.
+
+    Finite values below ``floor_dbz`` are clipped to the floor before
+    conversion. Missing values remain NaN.
+    """
+    arr = np.asarray(values, dtype=float)
+    out = np.full(arr.shape, np.nan, dtype=float)
+    finite = np.isfinite(arr)
+    if finite.any():
+        clipped = np.maximum(arr[finite], float(floor_dbz))
+        out[finite] = np.power(10.0, clipped / 10.0)
+    return out
+
+
+def linear_z_to_dbz(values, floor_dbz=REFLECTIVITY_FLOOR_DBZ):
+    """Convert linear Z back to dBZ while preserving missing values."""
+    arr = np.asarray(values, dtype=float)
+    out = np.full(arr.shape, np.nan, dtype=float)
+    finite = np.isfinite(arr) & (arr > 0.0)
+    if finite.any():
+        out[finite] = 10.0 * np.log10(arr[finite])
+        out[finite] = np.maximum(out[finite], float(floor_dbz))
+    return out
+
+
+def regrid_reflectivity_to_regular(
+    model_da,
+    model_ds,
+    target_lat,
+    target_lon,
+    method="linear",
+    floor_dbz=REFLECTIVITY_FLOOR_DBZ,
+):
+    """Regrid reflectivity in linear Z rather than logarithmic dBZ."""
+    lat, lon = _model_latlon(model_ds)
+    dbz = np.asarray(model_da.squeeze().values, float)
+    values = dbz_to_linear_z(dbz, floor_dbz=floor_dbz)
+    points = np.column_stack([lon.values.ravel(), lat.values.ravel()])
+    vals = values.ravel()
+    good = np.isfinite(points).all(axis=1) & np.isfinite(vals)
+
+    tlon, tlat = np.meshgrid(np.asarray(target_lon), np.asarray(target_lat))
+    out_z = griddata(points[good], vals[good], (tlon, tlat), method=method)
+    if np.isnan(out_z).any():
+        nearest = griddata(points[good], vals[good], (tlon, tlat), method="nearest")
+        out_z = np.where(np.isfinite(out_z), out_z, nearest)
+    return linear_z_to_dbz(out_z, floor_dbz=floor_dbz)
+
+
+def regrid_reflectivity_curvilinear(
+    source_da,
+    source_lat,
+    source_lon,
+    target_lat,
+    target_lon,
+    method="linear",
+    floor_dbz=REFLECTIVITY_FLOOR_DBZ,
+):
+    """Regrid curvilinear reflectivity in linear Z."""
+    dbz = np.asarray(source_da.squeeze().values, float)
+    values = dbz_to_linear_z(dbz, floor_dbz=floor_dbz)
+    points = np.column_stack([source_lon.values.ravel(), source_lat.values.ravel()])
+    vals = values.ravel()
+    good = np.isfinite(points).all(axis=1) & np.isfinite(vals)
+    target = (np.asarray(target_lon), np.asarray(target_lat))
+    out_z = griddata(points[good], vals[good], target, method=method)
+    if np.isnan(out_z).any():
+        nearest = griddata(points[good], vals[good], target, method="nearest")
+        out_z = np.where(np.isfinite(out_z), out_z, nearest)
+    return linear_z_to_dbz(out_z, floor_dbz=floor_dbz)
+
+
 SURFACE_COMPARISON = {
     "air_temperature_2m": ("air_temperature_f", "Air Temperature", "degC"),
     "dew_point_temperature_2m": ("dew_point_temperature_f", "Dew Point", "degC"),
@@ -104,13 +181,18 @@ def build_radar_difference(model_ds, radar_ds, model_variable="composite_reflect
     radar = radar_ds["reflectivity"].squeeze(drop=True).astype(float)
 
     if radar_ds["latitude"].ndim == 1 and radar_ds["longitude"].ndim == 1:
-        model_on_radar = regrid_model_to_regular(
+        model_on_radar = regrid_reflectivity_to_regular(
             model_ds[model_variable],
             model_ds,
             radar_ds.latitude.values,
             radar_ds.longitude.values,
+            floor_dbz=REFLECTIVITY_FLOOR_DBZ,
         )
-        obs = radar.values
+        obs = np.where(
+            np.isfinite(radar.values),
+            np.maximum(radar.values, REFLECTIVITY_FLOOR_DBZ),
+            np.nan,
+        )
         difference = model_on_radar - obs
         echo = (model_on_radar >= 5.0) | (obs >= 5.0)
         difference = np.where(echo, difference, np.nan)
@@ -126,14 +208,19 @@ def build_radar_difference(model_ds, radar_ds, model_variable="composite_reflect
             },
         )
     else:
-        model_on_radar = regrid_curvilinear_to_curvilinear(
+        model_on_radar = regrid_reflectivity_curvilinear(
             model_ds[model_variable],
             model_ds.latitude,
             model_ds.longitude,
             radar_ds.latitude,
             radar_ds.longitude,
+            floor_dbz=REFLECTIVITY_FLOOR_DBZ,
         )
-        obs = radar.values
+        obs = np.where(
+            np.isfinite(radar.values),
+            np.maximum(radar.values, REFLECTIVITY_FLOOR_DBZ),
+            np.nan,
+        )
         difference = model_on_radar - obs
         echo = (model_on_radar >= 5.0) | (obs >= 5.0)
         difference = np.where(echo, difference, np.nan)
@@ -160,6 +247,9 @@ def build_radar_difference(model_ds, radar_ds, model_variable="composite_reflect
         "radar_time": radar_ds.attrs.get("analysis_time",""),
         "radar_source": source,
         "difference_definition": "model_minus_observation",
+        "reflectivity_regridding": "linear_Z",
+        "reflectivity_floor_dbz": float(REFLECTIVITY_FLOOR_DBZ),
+        "reflectivity_regridding_note": "Reflectivity is converted dBZ->linear Z before spatial interpolation and converted back to dBZ before differencing.",
     })
     return result
 

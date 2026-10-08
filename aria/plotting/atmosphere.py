@@ -6,6 +6,8 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import matplotlib.pyplot as plt
 import numpy as np
+from aria.plotting.cities import add_mpl_cities
+from aria.plotting.state_floor import add_state_floor
 import pandas as pd
 import plotly.graph_objects as go
 
@@ -293,6 +295,7 @@ def make_3d_temperature_figure(
         height=850,
     )
 
+    add_state_floor(fig,0.0,lon0=lon0,lat0=lat0,west=region.west,east=region.east,south=region.south,north=region.north,color="black",width=3)
     return fig
 
 
@@ -361,6 +364,7 @@ def plot_temperature_slice(
         resolution="50m",
         linewidth=0.6,
     )
+    add_mpl_cities(ax,region,font_size=8)
 
     cbar = fig.colorbar(
         mesh,
@@ -550,12 +554,13 @@ def make_3d_layer_explorer(
             aspectmode="manual",
             aspectratio=dict(x=1.6, y=1.0, z=0.7),
             camera=dict(
-                eye=dict(x=1.45, y=1.45, z=1.0)
+                eye=dict(x=1.15, y=-1.75, z=1.05), up=dict(x=0, y=0, z=1), center=dict(x=0, y=0, z=-0.05)
             ),
         ),
         height=850,
     )
 
+    add_state_floor(fig,0.0,lon0=lon0,lat0=lat0,west=region.west,east=region.east,south=region.south,north=region.north,color="black",width=3)
     return fig
 
 
@@ -747,6 +752,8 @@ def make_3d_slice_explorer(
             xaxis_title="East / West (km)",
             yaxis_title="North / South (km)",
             zaxis_title="Altitude (km MSL)",
+            xaxis=dict(range=[float(np.nanmin(lonlat_to_xy_km(np.array([region.west,region.east]),np.array([lat0,lat0]),lon0,lat0)[0])),float(np.nanmax(lonlat_to_xy_km(np.array([region.west,region.east]),np.array([lat0,lat0]),lon0,lat0)[0]))]),
+            yaxis=dict(range=[float(np.nanmin(lonlat_to_xy_km(np.array([lon0,lon0]),np.array([region.south,region.north]),lon0,lat0)[1])),float(np.nanmax(lonlat_to_xy_km(np.array([lon0,lon0]),np.array([region.south,region.north]),lon0,lat0)[1]))]),
             zaxis=dict(range=[0, 16]),
             aspectmode="manual",
             aspectratio=dict(
@@ -755,16 +762,13 @@ def make_3d_slice_explorer(
                 z=0.85,
             ),
             camera=dict(
-                eye=dict(
-                    x=1.45,
-                    y=1.45,
-                    z=1.0,
-                )
+                eye=dict(x=1.15, y=-1.75, z=1.05), up=dict(x=0, y=0, z=1), center=dict(x=0, y=0, z=-0.05)
             ),
         ),
         height=850,
     )
 
+    add_state_floor(fig,0.0,lon0=lon0,lat0=lat0,west=region.west,east=region.east,south=region.south,north=region.north,color="black",width=3)
     return fig
 
 
@@ -781,11 +785,15 @@ def plot_atmosphere_slice(atmosphere_ds, variable, altitude_km, region,
                           *, cmap=None, vmin=None, vmax=None, output_path=None,
                           wind_barbs=False, barb_skip=4):
     style=VARIABLE_STYLE.get(variable,{"label":variable,"units":"","cmap":"viridis"})
-    field=atmosphere_ds[variable].sel(altitude_km=altitude_km,method="nearest")
+    if variable=="wind_speed" and "u_wind" in atmosphere_ds and "v_wind" in atmosphere_ds:
+        field=np.hypot(atmosphere_ds["u_wind"],atmosphere_ds["v_wind"]).sel(altitude_km=altitude_km,method="nearest")
+        field.attrs.update(long_name="Wind Speed", units="kt")
+    else:
+        field=atmosphere_ds[variable].sel(altitude_km=altitude_km,method="nearest")
     actual=float(field.altitude_km.values); finite=field.values[np.isfinite(field.values)]
     if cmap is None: cmap=style["cmap"]
     if finite.size:
-        if vmin is None: vmin=float(np.nanpercentile(finite,2))
+        if vmin is None: vmin=0.0 if variable=="wind_speed" else float(np.nanpercentile(finite,2))
         if vmax is None: vmax=float(np.nanpercentile(finite,98))
     fig=plt.figure(figsize=(11,7)); ax=plt.axes(projection=ccrs.PlateCarree())
     ax.set_extent([region.west,region.east,region.south,region.north],ccrs.PlateCarree())
@@ -799,6 +807,7 @@ def plot_atmosphere_slice(atmosphere_ds, variable, altitude_km, region,
                  length=5,linewidth=0.5,color="black",transform=ccrs.PlateCarree(),zorder=7)
     ax.add_feature(cfeature.LAKES.with_scale("50m"),facecolor="none",edgecolor="0.3")
     ax.add_feature(cfeature.STATES.with_scale("50m"),linewidth=0.5); ax.coastlines(resolution="50m",linewidth=0.6)
+    add_mpl_cities(ax,region,font_size=8)
     fig.colorbar(mesh,ax=ax,pad=.02,label=f'{style["label"]} ({style["units"]})')
     ax.set_title(f'{style["label"]} — {actual:g} km MSL')
     if output_path:
@@ -812,13 +821,17 @@ def make_3d_variable_slice_explorer(atmosphere_ds, region, *, variable="air_temp
     style=VARIABLE_STYLE.get(variable,{"label":variable,"units":"","cmap":"Viridis","profile":None})
     lon0=(region.west+region.east)/2; lat0=(region.south+region.north)/2
     lon=atmosphere_ds.longitude.values; lat=atmosphere_ds.latitude.values
-    altitude=atmosphere_ds.altitude_km.values; data=atmosphere_ds[variable].values
+    altitude=atmosphere_ds.altitude_km.values
+    if variable=="wind_speed" and "u_wind" in atmosphere_ds and "v_wind" in atmosphere_ds:
+        data=np.hypot(atmosphere_ds["u_wind"].values,atmosphere_ds["v_wind"].values)
+    else:
+        data=atmosphere_ds[variable].values
     latitude=float(np.nanmean(lat)) if latitude is None else latitude
     longitude=float(np.nanmean(lon)) if longitude is None else longitude
     zi=int(np.nanargmin(abs(altitude-altitude_km))); yi=int(np.nanargmin(abs(lat-latitude))); xi=int(np.nanargmin(abs(lon-longitude)))
     finite=data[np.isfinite(data)]
     if finite.size:
-        vmin=float(np.nanpercentile(finite,2)) if vmin is None else vmin
+        vmin=(0.0 if variable=="wind_speed" else float(np.nanpercentile(finite,2))) if vmin is None else vmin
         vmax=float(np.nanpercentile(finite,98)) if vmax is None else vmax
     cmap=style["cmap"] if cmap is None else cmap
     # Plotly names differ from matplotlib; map common names.
@@ -844,8 +857,17 @@ def make_3d_variable_slice_explorer(atmosphere_ds, region, *, variable="air_temp
                 marker=dict(size=3,color=vals,colorscale=plotly_scale,cmin=vmin,cmax=vmax,showscale=False),
                 name=f"{station} {style['label']}",
                 hovertemplate=f"{station}<br>Alt %{{z:.2f}} km<br>{style['label']} %{{marker.color:.1f}} {style['units']}<extra></extra>"))
-    fig.update_layout(title=f'GPGL 3-D {style["label"]} Slice Explorer',
+    corner_lon=np.array([region.west,region.east,region.west,region.east],float)
+    corner_lat=np.array([region.south,region.south,region.north,region.north],float)
+    cx,cy=lonlat_to_xy_km(corner_lon,corner_lat,lon0,lat0)
+    fig.update_layout(title=f'ARIA 3-D {style["label"]} Slice Explorer',
                       scene=dict(xaxis_title="East/West (km)",yaxis_title="North/South (km)",zaxis_title="Altitude (km MSL)",
-                                 zaxis=dict(range=[0,16]),aspectmode="manual",aspectratio=dict(x=1.6,y=1,z=.85)),
+                                 xaxis=dict(range=[float(np.nanmin(cx)),float(np.nanmax(cx))]),
+                                 yaxis=dict(range=[float(np.nanmin(cy)),float(np.nanmax(cy))]),
+                                 zaxis=dict(range=[0,16]),aspectmode="manual",aspectratio=dict(x=1.6,y=1,z=.85),
+                                 camera=dict(eye=dict(x=1.15,y=-1.75,z=1.05),
+                                             up=dict(x=0,y=0,z=1),
+                                             center=dict(x=0,y=0,z=-0.05))),
                       height=850)
+    add_state_floor(fig,float(np.nanmin(altitude)),lon0=lon0,lat0=lat0,west=region.west,east=region.east,south=region.south,north=region.north,color="black",width=3)
     return fig

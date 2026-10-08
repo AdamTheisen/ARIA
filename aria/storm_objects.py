@@ -167,14 +167,21 @@ def _grid_area_km2(lat: np.ndarray, lon: np.ndarray) -> float:
 def summarize_objects(
     labels: xr.DataArray,
     reflectivity: xr.DataArray,
-    comparison: xr.Dataset,
+    comparison: xr.Dataset | None = None,
     *,
-    prefix: str,
+    prefix: str = "T",
+    latitude=None,
+    longitude=None,
 ) -> pd.DataFrame:
-    """Summarize ADAPT labels into a model/observation-neutral object table."""
+    """Summarize ADAPT labels for comparison grids or a single radar sweep."""
     lab = np.asarray(labels.values, dtype=int)
     refl = np.asarray(reflectivity.values, dtype=float)
-    lat, lon = _latlon_mesh(comparison)
+    if latitude is not None and longitude is not None:
+        lat = np.asarray(latitude, dtype=float); lon = np.asarray(longitude, dtype=float)
+    elif comparison is not None:
+        lat, lon = _latlon_mesh(comparison)
+    else:
+        raise ValueError("Provide either comparison or explicit latitude/longitude arrays.")
     if lab.shape != refl.shape or lab.shape != lat.shape:
         raise ValueError("Labels, reflectivity, and latitude/longitude must share a shape.")
     cell_area = _grid_area_km2(lat, lon)
@@ -323,26 +330,80 @@ def build_adapt_object_comparison(
     return model_labels, observed_labels, model_objects, observed_objects, matches, metrics
 
 
-def extract_object_boundaries(labels, x=None, y=None, simplify_stride=3):
-    """Return lightweight x/y polygon vertices for each positive object label."""
+def extract_object_boundaries(labels, x=None, y=None, simplify_stride=2):
+    """Return cleaned display polygons for positive object labels.
+
+    Quantitative object masks are not modified.  The display outline receives a
+    light binary closing/opening pass and contour extraction so one-cell spikes
+    and angular point-order artifacts do not dominate the visualization.
+    ``x``/``y`` may be either 1-D grid axes or 2-D geographic coordinates.
+    """
     import numpy as np
     from scipy import ndimage
+    import matplotlib.pyplot as plt
+
     lab=np.asarray(labels.values if hasattr(labels,"values") else labels)
-    x=np.arange(lab.shape[1],dtype=float) if x is None else np.asarray(x,float)
-    y=np.arange(lab.shape[0],dtype=float) if y is None else np.asarray(y,float)
+    if lab.ndim!=2:
+        raise ValueError("Object-boundary extraction requires a 2-D label mask.")
+
+    if x is None:
+        x=np.arange(lab.shape[1],dtype=float)
+    else:
+        x=np.asarray(x,float)
+    if y is None:
+        y=np.arange(lab.shape[0],dtype=float)
+    else:
+        y=np.asarray(y,float)
+
     out={}
+    structure=np.ones((3,3),dtype=bool)
     for ident in np.unique(lab[np.isfinite(lab)]):
-        if ident <= 0: continue
-        mask=(lab==ident)
-        edge=mask ^ ndimage.binary_erosion(mask)
-        rr,cc=np.where(edge)
-        if not len(rr): continue
-        # Order edge points by angle around centroid; adequate for plotting and tiny on wire.
-        cy,cx=rr.mean(),cc.mean()
-        order=np.argsort(np.arctan2(rr-cy,cc-cx))
+        if ident<=0:
+            continue
+        raw=(lab==ident)
+        if not raw.any():
+            continue
+
+        # Display-only cleanup. Preserve the original mask for all metrics.
+        cleaned=ndimage.binary_closing(raw,structure=structure,iterations=1)
+        cleaned=ndimage.binary_opening(cleaned,structure=structure,iterations=1)
+        # Avoid erasing genuinely tiny objects.
+        if cleaned.sum()<max(4,int(raw.sum()*0.35)):
+            cleaned=raw
+
+        # Matplotlib contour provides an ordered boundary and avoids the former
+        # angle-around-centroid ordering that produced long crossing spikes.
+        fig,ax=plt.subplots(figsize=(1,1))
+        try:
+            cs=ax.contour(cleaned.astype(float),levels=[0.5])
+            paths=[
+                np.asarray(seg,float)
+                for seg in (cs.allsegs[0] if cs.allsegs else [])
+                if len(seg)>=4
+            ]
+        finally:
+            plt.close(fig)
+        if not paths:
+            continue
+
+        # Keep the longest external path for this object.
+        verts=max(paths,key=len)
+        col=verts[:,0]
+        row=verts[:,1]
         step=max(1,int(simplify_stride))
-        rr,cc=rr[order][::step],cc[order][::step]
-        coords=np.column_stack([x[cc],y[rr]])
-        if len(coords): coords=np.vstack([coords,coords[0]])
-        out[int(ident)]=coords
+        row=row[::step]; col=col[::step]
+
+        if x.ndim==1 and y.ndim==1:
+            xx=np.interp(col,np.arange(len(x)),x)
+            yy=np.interp(row,np.arange(len(y)),y)
+        elif x.ndim==2 and y.ndim==2:
+            xx=ndimage.map_coordinates(x,[row,col],order=1,mode="nearest")
+            yy=ndimage.map_coordinates(y,[row,col],order=1,mode="nearest")
+        else:
+            raise ValueError("x and y must both be 1-D axes or both be 2-D coordinate grids.")
+
+        coords=np.column_stack([xx,yy])
+        if len(coords):
+            coords=np.vstack([coords,coords[0]])
+            out[int(ident)]=coords
     return out

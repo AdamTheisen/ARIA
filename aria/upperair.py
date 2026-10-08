@@ -146,11 +146,10 @@ def build_upper_air_dataset(raob_df, west,east,south,north,
     # reported speed column is missing but u/v were successfully derived.
     if "u_wind" in ds and "v_wind" in ds:
         derived=np.hypot(ds["u_wind"],ds["v_wind"])
-        if "wind_speed" not in ds or not np.isfinite(ds["wind_speed"].values).any():
-            ds["wind_speed"]=derived
-            ds["wind_speed"].attrs.update({"units":"kt","long_name":"Wind speed","derived_from":"u_wind,v_wind"})
-        else:
-            ds["wind_speed"]=ds["wind_speed"].where(np.isfinite(ds["wind_speed"]),derived)
+        ds["wind_speed"]=derived
+        ds["wind_speed"].attrs.update({
+            "units":"kt","long_name":"Wind speed","derived_from":"u_wind,v_wind"
+        })
 
     ds.attrs.update({"analysis_type":"trajectory-aware radiosonde multi-variable analysis",
                      "variables":",".join(UPPER_AIR_VARIABLES)})

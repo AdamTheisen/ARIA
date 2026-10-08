@@ -47,6 +47,42 @@ def _standardize_reflectivity(radar):
     return True
 
 
+
+REFLECTIVITY_FLOOR_DBZ = -30.0
+
+
+def _add_linear_reflectivity(radar, floor_dbz=REFLECTIVITY_FLOOR_DBZ):
+    """Add a temporary linear-Z field for physically appropriate gridding."""
+    if not _standardize_reflectivity(radar):
+        return False
+    source = radar.fields["reflectivity"]
+    raw = source["data"]
+    values = np.ma.filled(raw, np.nan).astype(float)
+    mask = np.ma.getmaskarray(raw) | ~np.isfinite(values)
+    z = np.full(values.shape, np.nan, dtype=float)
+    good = ~mask
+    z[good] = np.power(10.0, np.maximum(values[good], float(floor_dbz)) / 10.0)
+    field = dict(source)
+    field["data"] = np.ma.array(z, mask=mask)
+    field["units"] = "mm6 m-3"
+    field["long_name"] = "linear radar reflectivity factor used for gridding"
+    radar.add_field("linear_reflectivity", field, replace_existing=True)
+    return True
+
+
+def _linear_grid_to_dbz(raw, floor_dbz=REFLECTIVITY_FLOOR_DBZ):
+    values = (
+        np.ma.filled(raw, np.nan).astype(float)
+        if np.ma.isMaskedArray(raw)
+        else np.asarray(raw, dtype=float)
+    )
+    out = np.full(values.shape, np.nan, dtype=float)
+    good = np.isfinite(values) & (values > 0.0)
+    out[good] = 10.0 * np.log10(values[good])
+    out[good] = np.maximum(out[good], float(floor_dbz))
+    return out
+
+
 def fetch_latest_regional_radars(
     *,
     radar_ids=None,
@@ -225,6 +261,10 @@ def grid_regional_reflectivity(
         )
     ) + 1
 
+    for radar in radars:
+        if not _add_linear_reflectivity(radar):
+            raise RuntimeError("A radar did not contain a usable reflectivity field.")
+
     grid = pyart.map.grid_from_radars(
         tuple(radars),
         grid_shape=(nz, ny, nx),
@@ -234,22 +274,14 @@ def grid_regional_reflectivity(
             (xmin_km * 1000.0, xmax_km * 1000.0),
         ),
         grid_origin=(lat0, lon0),
-        fields=["reflectivity"],
+        fields=["linear_reflectivity"],
         weighting_function="Barnes2",
         roi_func="dist_beam",
     )
 
-    reflectivity = np.asarray(
-        grid.fields["reflectivity"]["data"]
-    ).astype(float)
-
-    if np.ma.isMaskedArray(
-        grid.fields["reflectivity"]["data"]
-    ):
-        reflectivity = np.ma.filled(
-            grid.fields["reflectivity"]["data"],
-            np.nan,
-        ).astype(float)
+    reflectivity = _linear_grid_to_dbz(
+        grid.fields["linear_reflectivity"]["data"]
+    )
 
     x_km = grid.x["data"] / 1000.0
     y_km = grid.y["data"] / 1000.0
@@ -347,6 +379,10 @@ def grid_regional_reflectivity_altitude(
     ny = int(np.ceil((ymax_km - ymin_km) / horizontal_resolution_km)) + 1
     z_m = altitude_km * 1000.0
 
+    for radar in radars:
+        if not _add_linear_reflectivity(radar):
+            raise RuntimeError("A radar did not contain a usable reflectivity field.")
+
     grid = pyart.map.grid_from_radars(
         tuple(radars),
         grid_shape=(1, ny, nx),
@@ -356,17 +392,14 @@ def grid_regional_reflectivity_altitude(
             (xmin_km * 1000.0, xmax_km * 1000.0),
         ),
         grid_origin=(lat0, lon0),
-        fields=["reflectivity"],
+        fields=["linear_reflectivity"],
         weighting_function="Barnes2",
         roi_func="dist_beam",
     )
 
-    raw = grid.fields["reflectivity"]["data"]
-    reflectivity = (
-        np.ma.filled(raw, np.nan).astype(float)
-        if np.ma.isMaskedArray(raw)
-        else np.asarray(raw, dtype=float)
-    )
+    raw = grid.fields["linear_reflectivity"]["data"]
+    reflectivity = _linear_grid_to_dbz(raw)
+
 
     lon2d, lat2d = grid.get_point_longitude_latitude(level=0)
 
@@ -396,8 +429,14 @@ def grid_regional_reflectivity_altitude(
         },
     )
     ds["reflectivity"].attrs.update(
-        {"long_name": "Radar reflectivity", "units": "dBZ"}
+        {
+            "long_name": "Radar reflectivity",
+            "units": "dBZ",
+            "gridding_space": "linear_Z",
+            "source_floor_dbz": float(REFLECTIVITY_FLOOR_DBZ),
+        }
     )
+    ds.attrs["reflectivity_gridding"] = "Py-ART Barnes2 applied to linear Z; converted to dBZ after gridding"
     return ds
 
 
@@ -407,14 +446,14 @@ def grid_single_radar_reflectivity(radar, *, horizontal_resolution_km=2.0, verti
         import pyart
     except ImportError as exc:
         raise RuntimeError("Single-radar 3-D gridding requires ARM Py-ART.") from exc
-    if not _standardize_reflectivity(radar):
+    if not _add_linear_reflectivity(radar):
         raise RuntimeError("No reflectivity field available for 3-D gridding.")
     nx=int(np.ceil(2*max_range_km/horizontal_resolution_km))+1
     ny=nx; nz=int(np.ceil(max_altitude_km/vertical_resolution_km))+1
     grid=pyart.map.grid_from_radars((radar,),grid_shape=(nz,ny,nx),
         grid_limits=((0,max_altitude_km*1000),(-max_range_km*1000,max_range_km*1000),(-max_range_km*1000,max_range_km*1000)),
-        fields=["reflectivity"],weighting_function="Barnes2")
+        fields=["linear_reflectivity"],weighting_function="Barnes2")
     z=np.asarray(grid.z["data"],float)/1000; y=np.asarray(grid.y["data"],float)/1000; x=np.asarray(grid.x["data"],float)/1000
-    data=np.asarray(grid.fields["reflectivity"]["data"].filled(np.nan),float)
+    data=_linear_grid_to_dbz(grid.fields["linear_reflectivity"]["data"])
     return xr.Dataset({"reflectivity":(("altitude_km","y_km","x_km"),data)},coords={"altitude_km":z,"y_km":y,"x_km":x},
         attrs={"radar_latitude":float(radar.latitude["data"][0]),"radar_longitude":float(radar.longitude["data"][0]),"horizontal_resolution_km":float(horizontal_resolution_km)})

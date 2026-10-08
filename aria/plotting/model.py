@@ -7,7 +7,28 @@ import cartopy.io.shapereader as shpreader
 import matplotlib.pyplot as plt
 import numpy as np
 from aria.storm_objects import extract_object_boundaries
+from aria.plotting.cities import add_plotly_cities, add_mpl_cities
 
+
+REFLECTIVITY_STYLE = {"cmap":"turbo","plotly":"Turbo","vmin":-30.0,"vmax":70.0,"units":"dBZ"}
+
+def mask_reflectivity_background(da):
+    """Mask explicit fills and a repeated minimum/no-echo reflectivity value."""
+    out=da.astype(float)
+    for key in ("_FillValue","missing_value"):
+        try:
+            fill=float(da.attrs.get(key))
+            out=out.where(~np.isclose(out,fill,rtol=0,atol=1e-6))
+        except Exception:
+            pass
+    vals=np.asarray(out.values,float)
+    finite=vals[np.isfinite(vals)]
+    if finite.size:
+        mn=float(np.nanmin(finite))
+        frac=float(np.count_nonzero(np.isclose(finite,mn,rtol=0,atol=1e-6)))/float(finite.size)
+        if frac >= 0.005 or mn <= -90:
+            out=out.where(~np.isclose(out,mn,rtol=0,atol=1e-6))
+    return out
 
 MODEL_STYLE = {
     "air_temperature_2m": ("2-m Air Temperature", "°C", "coolwarm"),
@@ -22,6 +43,7 @@ MODEL_STYLE = {
     "categorical_freezing_rain": ("Categorical Freezing Rain", "1", "viridis"),
     "categorical_ice_pellets": ("Categorical Ice Pellets", "1", "viridis"),
     "surface_pressure": ("Surface Pressure", "Pa", "viridis"),
+    "terrain_height": ("Terrain Elevation", "m", "terrain"),
     "air_temperature": ("Air Temperature", "°C", "coolwarm"),
     "dew_point_temperature": ("Dew Point", "°C", "BrBG"),
     "wind_speed": ("Wind Speed", "m s$^{-1}$", "viridis"),
@@ -47,6 +69,7 @@ def _map_base(ax, region):
     ax.add_feature(cfeature.STATES.with_scale("50m"), linewidth=0.45)
     ax.add_feature(cfeature.BORDERS.with_scale("50m"), linewidth=0.5)
     ax.coastlines(resolution="50m", linewidth=0.5)
+    add_mpl_cities(ax, region)
 
 
 def plot_model_field(
@@ -60,8 +83,11 @@ def plot_model_field(
     vmax=None,
     overlay=None,
     output_path=None,
+    title=None,
 ):
     da = ds[variable]
+    if "reflect" in str(variable).lower() or "reflect" in str(getattr(da,"name","")).lower():
+        da=mask_reflectivity_background(da)
     if pressure_hpa is not None and "pressure_hpa" in da.dims:
         da = da.sel(pressure_hpa=pressure_hpa, method="nearest").squeeze(drop=True)
 
@@ -103,15 +129,16 @@ def plot_model_field(
         )
 
     fig.colorbar(mesh, ax=ax, pad=0.02, label=f"{label} ({units})")
-    title = f"{ds.attrs.get('model','MODEL').upper()} — {label}"
-    if pressure_hpa is not None and "pressure_hpa" in ds.coords:
-        level = float(da.coords.get("pressure_hpa", pressure_hpa))
-        title += f" — {level:g} hPa"
-    title += (
-        f"\nInit {ds.attrs.get('initialization_time','?')}  "
-        f"F{int(ds.attrs.get('forecast_hour',0)):02d}  "
-        f"Valid {ds.attrs.get('valid_time','?')}"
-    )
+    if title is None:
+        title = f"{ds.attrs.get('model','MODEL').upper()} — {label}"
+        if pressure_hpa is not None and "pressure_hpa" in ds.coords:
+            level = float(da.coords.get("pressure_hpa", pressure_hpa))
+            title += f" — {level:g} hPa"
+        title += (
+            f"\nInit {ds.attrs.get('initialization_time','?')}  "
+            f"F{int(ds.attrs.get('forecast_hour',0)):02d}  "
+            f"Valid {ds.attrs.get('valid_time','?')}"
+        )
     ax.set_title(title)
 
     if output_path:
@@ -231,6 +258,35 @@ def overlay_regional_radar(fig, radar_ds, *, altitude_km=2.0, min_dbz=10.0):
     )
     return fig
 
+
+
+
+def overlay_mrms_reflectivity(fig, mrms_ds, *, min_dbz=10.0):
+    """Overlay a lightweight MRMS QC composite on an existing model map."""
+    import cartopy.crs as ccrs
+    ax = fig.axes[0]
+    field = mrms_ds["reflectivity"]
+    if "time" in field.dims:
+        field = field.isel(time=-1)
+    field = field.squeeze(drop=True)
+    values = np.where(np.asarray(field.values, float) >= float(min_dbz), field.values, np.nan)
+    mesh = ax.pcolormesh(
+        mrms_ds["longitude"],
+        mrms_ds["latitude"],
+        values,
+        shading="auto",
+        cmap="turbo",
+        vmin=float(min_dbz),
+        vmax=70.0,
+        alpha=0.38,
+        transform=ccrs.PlateCarree(),
+        zorder=7,
+    )
+    fig.colorbar(
+        mesh, ax=ax, pad=0.08, fraction=0.035,
+        label="MRMS QC Composite (dBZ)",
+    )
+    return fig
 
 
 def plot_three_panel_comparison(
@@ -428,20 +484,287 @@ def mpl_to_plotly_colorscale(cmap_name, samples=21):
     return values
 
 
-def plot_interactive_field(da, region, *, title, units="", zmin=None, zmax=None, colorscale="Turbo", state_color="rgba(20,20,20,.95)"):
+
+def _regularize_interactive_da(da, max_points=320):
+    """Return regular 1-D lon/lat axes and a 2-D field for Plotly.
+
+    Native HRRR fields are commonly on a curvilinear Lambert grid.  Surface,
+    MRMS, and several ARIA analyses already use regular lat/lon axes.  For a
+    curvilinear source we make a bounded nearest-neighbor display grid so the
+    scientific source stays untouched while the interactive map remains fast.
+    """
+    lat=np.asarray(da.latitude.values,float)
+    lon=np.asarray(da.longitude.values,float)
+    z=np.asarray(da.squeeze(drop=True).values,float)
+    if lat.ndim==1 and lon.ndim==1:
+        return lon,lat,z
+    if lat.ndim!=2 or lon.ndim!=2 or z.ndim!=2:
+        raise ValueError("Interactive field requires either 1-D or 2-D latitude/longitude coordinates.")
+    good=np.isfinite(lat)&np.isfinite(lon)&np.isfinite(z)
+    if not good.any():
+        # preserve domain even when the field is empty
+        good_geo=np.isfinite(lat)&np.isfinite(lon)
+        if not good_geo.any():
+            raise ValueError("Interactive field has no finite geographic coordinates.")
+        good=good_geo
+    west,east=float(np.nanmin(lon[good])),float(np.nanmax(lon[good]))
+    south,north=float(np.nanmin(lat[good])),float(np.nanmax(lat[good]))
+    ny=min(int(max_points),max(80,z.shape[0]))
+    nx=min(int(max_points),max(80,z.shape[1]))
+    x=np.linspace(west,east,nx)
+    y=np.linspace(south,north,ny)
+    xx,yy=np.meshgrid(x,y)
+    src=np.column_stack([lon[good],lat[good]])
+    vals=z[good]
+    try:
+        from scipy.spatial import cKDTree
+        tree=cKDTree(src)
+        _,ind=tree.query(np.column_stack([xx.ravel(),yy.ravel()]),k=1)
+        zz=vals[ind].reshape(yy.shape)
+    except Exception:
+        # Lightweight fallback: nearest index in projected array space.
+        # This is display-only and never changes stored/model data.
+        rr=np.linspace(0,z.shape[0]-1,ny).round().astype(int)
+        cc=np.linspace(0,z.shape[1]-1,nx).round().astype(int)
+        zz=z[np.ix_(rr,cc)]
+    return x,y,zz
+
+
+def add_interactive_wind_overlay(fig,u_da,v_da,region,*,mode="Arrows",density="Medium"):
+    """Add interactive wind arrows or streamlines to an existing Plotly map."""
+    import plotly.graph_objects as go
+    if mode in (None,"None"):
+        return fig
+    ux,uy,u=_regularize_interactive_da(u_da,max_points=220)
+    vx,vy,v=_regularize_interactive_da(v_da,max_points=220)
+    # Components originate from the same analysis grid; align defensively.
+    if u.shape!=v.shape or not np.allclose(ux,vx) or not np.allclose(uy,vy):
+        return fig
+    density_map={"Sparse":14,"Medium":9,"Dense":6}
+    skip=density_map.get(str(density),9)
+    coslat=max(np.cos(np.deg2rad((float(region.south)+float(region.north))/2)),0.25)
+
+    if mode=="Arrows":
+        xs=[]; ys=[]
+        max_speed=float(np.nanpercentile(np.hypot(u,v),95)) if np.isfinite(u).any() and np.isfinite(v).any() else 1.0
+        max_speed=max(max_speed,1.0)
+        base=0.018*max(float(region.east)-float(region.west),1.0)
+        for j in range(skip//2,len(uy),skip):
+            for i in range(skip//2,len(ux),skip):
+                uu=float(u[j,i]); vv=float(v[j,i])
+                sp=float(np.hypot(uu,vv))
+                if not np.isfinite(sp) or sp<=0: continue
+                scale=base*(0.45+0.75*min(sp/max_speed,1.0))
+                dx=(uu/sp)*scale/coslat
+                dy=(vv/sp)*scale
+                x0=float(ux[i]-dx/2); y0=float(uy[j]-dy/2)
+                x1=float(ux[i]+dx/2); y1=float(uy[j]+dy/2)
+                # shaft
+                xs.extend([x0,x1,None]); ys.extend([y0,y1,None])
+                # two short arrowhead wings
+                ang=np.arctan2(dy,dx)
+                wing=0.28*np.hypot(dx,dy)
+                for off in (2.55,-2.55):
+                    xs.extend([x1,x1+wing*np.cos(ang+off),None])
+                    ys.extend([y1,y1+wing*np.sin(ang+off),None])
+        fig.add_trace(go.Scatter(
+            x=xs,y=ys,mode="lines",name="Wind",
+            line=dict(color="rgba(20,20,20,.72)",width=1.2),
+            hoverinfo="skip",showlegend=False,
+        ))
+        return fig
+
+    # Streamlines: integrate a normalized vector field from a modest seed grid.
+    try:
+        from scipy.interpolate import RegularGridInterpolator
+        fu=RegularGridInterpolator((uy,ux),u,bounds_error=False,fill_value=np.nan)
+        fv=RegularGridInterpolator((uy,ux),v,bounds_error=False,fill_value=np.nan)
+    except Exception:
+        return add_interactive_wind_overlay(fig,u_da,v_da,region,mode="Arrows",density=density)
+
+    nseed={"Sparse":6,"Medium":9,"Dense":12}.get(str(density),9)
+    seed_x=np.linspace(float(region.west),float(region.east),nseed+2)[1:-1]
+    seed_y=np.linspace(float(region.south),float(region.north),max(4,int(nseed*0.65))+2)[1:-1]
+    step=0.012*max(float(region.east)-float(region.west),1.0)
+    paths_x=[]; paths_y=[]
+    for sy in seed_y:
+        for sx in seed_x:
+            line=[]
+            for direction in (-1.0,1.0):
+                x=float(sx); y=float(sy); pts=[]
+                for _ in range(55):
+                    uu=float(fu((y,x))); vv=float(fv((y,x)))
+                    sp=float(np.hypot(uu,vv))
+                    if not np.isfinite(sp) or sp<0.2: break
+                    pts.append((x,y))
+                    x += direction*step*(uu/sp)/max(np.cos(np.deg2rad(y)),0.25)
+                    y += direction*step*(vv/sp)
+                    if not (region.west<=x<=region.east and region.south<=y<=region.north): break
+                if direction<0: pts=pts[::-1]
+                if direction<0: line.extend(pts)
+                else: line.extend(pts[1:] if line and pts else pts)
+            if len(line)>3:
+                paths_x.extend([q[0] for q in line]+[None])
+                paths_y.extend([q[1] for q in line]+[None])
+    fig.add_trace(go.Scatter(
+        x=paths_x,y=paths_y,mode="lines",name="Wind streamlines",
+        line=dict(color="rgba(20,20,20,.62)",width=1.1),
+        hoverinfo="skip",showlegend=False,
+    ))
+    return fig
+
+
+def add_interactive_environment_overlay(
+    fig, ds, region, *, pressure_hpa=500,
+    show_temperature=True, show_wind=True, show_height=False,
+    wind_density="Medium", temperature_interval=2.0, height_interval=60.0,
+):
+    """Overlay HRRR upper-air context on an existing Plotly geographic map."""
+    import plotly.graph_objects as go
+    level=float(pressure_hpa)
+
+    def _level(name):
+        if name not in ds:
+            return None
+        da=ds[name]
+        if "pressure_hpa" in da.dims or "pressure_hpa" in da.coords:
+            da=da.sel(pressure_hpa=level,method="nearest")
+        return da.squeeze(drop=True)
+
+    if show_temperature:
+        temp=_level("air_temperature")
+        if temp is not None:
+            x,y,z=_regularize_interactive_da(temp,max_points=200)
+            finite=z[np.isfinite(z)]
+            if finite.size:
+                step=max(float(temperature_interval),0.1)
+                lo=float(np.floor(np.nanmin(finite)/step)*step)
+                hi=float(np.ceil(np.nanmax(finite)/step)*step)
+                if hi<=lo: hi=lo+step
+                fig.add_trace(go.Contour(
+                    x=x,y=y,z=z,showscale=False,hoverinfo="skip",
+                    contours=dict(start=lo,end=hi,size=step,coloring="none"),
+                    line=dict(color="rgba(180,35,35,.90)",width=1.4),
+                    name=f"{int(level)} hPa temperature",showlegend=False,
+                ))
+
+    if show_height:
+        gh=_level("geopotential_height")
+        if gh is not None:
+            x,y,z=_regularize_interactive_da(gh,max_points=200)
+            finite=z[np.isfinite(z)]
+            if finite.size:
+                step=max(float(height_interval),1.0)
+                lo=float(np.floor(np.nanmin(finite)/step)*step)
+                hi=float(np.ceil(np.nanmax(finite)/step)*step)
+                if hi<=lo: hi=lo+step
+                fig.add_trace(go.Contour(
+                    x=x,y=y,z=z,showscale=False,hoverinfo="skip",
+                    contours=dict(start=lo,end=hi,size=step,coloring="none"),
+                    line=dict(color="rgba(30,30,30,.80)",width=1.1),
+                    name=f"{int(level)} hPa height",showlegend=False,
+                ))
+
+    if show_wind:
+        u=_level("u_wind"); v=_level("v_wind")
+        if u is not None and v is not None:
+            fig=add_interactive_wind_overlay(fig,u,v,region,mode="Arrows",density=wind_density)
+    return fig
+
+
+def add_mpl_environment_overlay(
+    ax, ds, region, *, pressure_hpa=500,
+    show_temperature=True, show_wind=True, show_height=False,
+    wind_density="Medium", temperature_interval=2.0, height_interval=60.0,
+):
+    """Overlay HRRR upper-air contours and wind barbs on a Cartopy axis."""
+    level=float(pressure_hpa)
+
+    def _level(name):
+        if name not in ds:
+            return None
+        da=ds[name]
+        if "pressure_hpa" in da.dims or "pressure_hpa" in da.coords:
+            da=da.sel(pressure_hpa=level,method="nearest")
+        return da.squeeze(drop=True)
+
+    def _geo(da):
+        if da is None: return None,None,None
+        return np.asarray(da.longitude.values,float),np.asarray(da.latitude.values,float),np.asarray(da.values,float)
+
+    if show_temperature:
+        da=_level("air_temperature"); lon,lat,z=_geo(da)
+        if z is not None and np.isfinite(z).any():
+            vals=z[np.isfinite(z)]
+            step=max(float(temperature_interval),0.1)
+            lo=np.floor(np.nanmin(vals)/step)*step
+            hi=np.ceil(np.nanmax(vals)/step)*step
+            if hi<=lo: hi=lo+step
+            cs=ax.contour(lon,lat,z,levels=np.arange(lo,hi+step*0.5,step),colors="firebrick",linewidths=1.0,alpha=.9,transform=ccrs.PlateCarree(),zorder=6)
+            try: ax.clabel(cs,fmt="%g°C",fontsize=7,inline=True)
+            except Exception: pass
+
+    if show_height:
+        da=_level("geopotential_height"); lon,lat,z=_geo(da)
+        if z is not None and np.isfinite(z).any():
+            vals=z[np.isfinite(z)]; step=max(float(height_interval),1.0)
+            lo=np.floor(np.nanmin(vals)/step)*step
+            hi=np.ceil(np.nanmax(vals)/step)*step
+            if hi<=lo: hi=lo+step
+            cs=ax.contour(lon,lat,z,levels=np.arange(lo,hi+step/2,step),colors="black",linewidths=.8,alpha=.75,transform=ccrs.PlateCarree(),zorder=6)
+            try: ax.clabel(cs,fmt="%g",fontsize=7,inline=True)
+            except Exception: pass
+
+    if show_wind:
+        u=_level("u_wind"); v=_level("v_wind")
+        if u is not None and v is not None:
+            lon=np.asarray(u.longitude.values,float); lat=np.asarray(u.latitude.values,float)
+            uu=np.asarray(u.values,float)*1.94384; vv=np.asarray(v.values,float)*1.94384
+            skip={"Sparse":28,"Medium":20,"Dense":14}.get(str(wind_density),20)
+            if lon.ndim==2 and lat.ndim==2:
+                sl=(slice(None,None,skip),slice(None,None,skip))
+                ax.barbs(lon[sl],lat[sl],uu[sl],vv[sl],length=4.5,linewidth=.45,color="black",transform=ccrs.PlateCarree(),zorder=7)
+            elif lon.ndim==1 and lat.ndim==1:
+                xx,yy=np.meshgrid(lon,lat); sl=(slice(None,None,skip),slice(None,None,skip))
+                ax.barbs(xx[sl],yy[sl],uu[sl],vv[sl],length=4.5,linewidth=.45,color="black",transform=ccrs.PlateCarree(),zorder=7)
+    return ax
+
+
+def overlay_interactive_mrms(fig,mrms_ds,*,min_dbz=10.0):
+    """Overlay MRMS reflectivity without converting an interactive map to Matplotlib."""
+    import plotly.graph_objects as go
+    field=mrms_ds["reflectivity"]
+    if "time" in field.dims: field=field.isel(time=-1)
+    lon,lat,z=_regularize_interactive_da(field)
+    z=np.where(z>=float(min_dbz),z,np.nan)
+    fig.add_trace(go.Heatmap(
+        x=lon,y=lat,z=z,zmin=-30,zmax=70,colorscale="Turbo",
+        opacity=.42,showscale=False,name="MRMS QC Composite",
+        hovertemplate="MRMS<br>Lon %{x:.2f}<br>Lat %{y:.2f}<br>%{z:.1f} dBZ<extra></extra>",
+    ))
+    return fig
+
+
+def plot_interactive_field(da, region, *, title, units="", zmin=None, zmax=None, colorscale="Turbo", state_color="rgba(20,20,20,.95)", show_cities=True, show_contours=False, contour_levels=None):
     """Interactive regular-lat/lon field with state boundaries and pan/zoom."""
     import plotly.graph_objects as go
-    lat=np.asarray(da.latitude.values); lon=np.asarray(da.longitude.values)
-    if lat.ndim!=1 or lon.ndim!=1:
-        raise ValueError("Interactive field requires regular 1-D latitude/longitude coordinates.")
-    z=np.asarray(da.values,float)
+    if "reflect" in str(getattr(da,"name","")).lower() or "reflect" in str(title).lower():
+        da=mask_reflectivity_background(da)
+    lon,lat,z=_regularize_interactive_da(da)
     fig=go.Figure(go.Heatmap(
         x=lon,y=lat,z=z,zmin=zmin,zmax=zmax,colorscale=colorscale,
         colorbar=dict(title=units),
         hovertemplate=f"Lon %{{x:.2f}}<br>Lat %{{y:.2f}}<br>%{{z:.1f}} {units}<extra></extra>",
     ))
+    if show_contours:
+        contours=dict(coloring="lines",showlabels=True,labelfont=dict(size=10,color="black"))
+        if contour_levels is not None and len(contour_levels)>=2:
+            levels=np.asarray(contour_levels,float); step=float(np.nanmedian(np.diff(levels)))
+            contours.update(start=float(levels.min()),end=float(levels.max()),size=step)
+        fig.add_trace(go.Contour(x=lon,y=lat,z=z,showscale=False,colorscale=[[0,"rgba(20,20,20,.85)"],[1,"rgba(20,20,20,.85)"]],line=dict(width=1),contours=contours,hoverinfo="skip",name="Contours",showlegend=False))
     for x,y in _interactive_state_lines(region):
         fig.add_trace(go.Scatter(x=x,y=y,mode="lines",line=dict(color=state_color,width=1.6),hoverinfo="skip",showlegend=False))
+    if show_cities: add_plotly_cities(fig,region,font_size=10)
     fig.update_layout(
         title=title,height=650,dragmode="zoom",
         xaxis=dict(title="Longitude",range=[region.west,region.east],constrain="domain"),
@@ -483,6 +806,13 @@ def plot_interactive_three_panel(
     d=np.asarray(comparison.difference.values,float)
 
     if radar:
+        for arr in (m,o):
+            finite=arr[np.isfinite(arr)]
+            if finite.size:
+                mn=float(np.nanmin(finite))
+                frac=float(np.count_nonzero(np.isclose(finite,mn,rtol=0,atol=1e-6)))/float(finite.size)
+                if frac >= 0.005 or mn <= -90:
+                    arr[np.isclose(arr,mn,rtol=0,atol=1e-6)]=np.nan
         vmin,vmax=-30.0,70.0
         colorscale="Turbo"
         if difference_limit is None: difference_limit=30.0
@@ -551,9 +881,11 @@ def plot_interactive_three_panel(
         row=1,col=3,
     )
 
+    state_line_color = "rgba(20,20,20,.95)"
     for x,y in _interactive_state_lines(region):
         for col in (1,2,3):
-            fig.add_trace(go.Scatter(x=x,y=y,mode="lines",line=dict(color="rgba(20,20,20,.95)",width=1.4),hoverinfo="skip",showlegend=False),row=1,col=col)
+            fig.add_trace(go.Scatter(x=x,y=y,mode="lines",line=dict(color=state_line_color,width=1.4),hoverinfo="skip",showlegend=False),row=1,col=col)
+    for col in (1,2,3): add_plotly_cities(fig,region,font_size=9,row=1,col=col)
 
     # Match x/y ranges so zooming one panel synchronizes the others.
     fig.update_xaxes(

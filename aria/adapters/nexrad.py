@@ -30,28 +30,124 @@ GPGL_NEXRAD_SITES = {
 }
 
 
+
+NEXRAD_DISPLAY_NAMES = {
+    **GPGL_NEXRAD_SITES,
+    "KTLX":"Oklahoma City, OK","KVNX":"Vance AFB/Enid, OK","KINX":"Tulsa, OK",
+    "KICT":"Wichita, KS","KDDC":"Dodge City, KS","KGLD":"Goodland, KS",
+    "KFTG":"Denver, CO","KPUX":"Pueblo, CO","KEAX":"Kansas City/Pleasant Hill, MO",
+    "KLSX":"St. Louis, MO","KILX":"Lincoln, IL","KGRR":"Grand Rapids, MI",
+    "KAPX":"Gaylord, MI","KMQT":"Marquette, MI",
+    "KFDR":"Frederick, OK","KTWX":"Topeka, KS","KSGF":"Springfield, MO",
+    "KSRX":"Fort Smith, AR","KAMA":"Amarillo, TX","KDYX":"Dyess AFB/Abilene, TX",
+    "KLBB":"Lubbock, TX","KFWS":"Dallas/Fort Worth, TX","KSHV":"Shreveport, LA",
+
+    # Southeast U.S. sites commonly included by the SE US regional preset.
+    "KFFC":"Atlanta/Peachtree City, GA","KJGX":"Robins AFB, GA",
+    "KBMX":"Birmingham/Calera, AL","KHTX":"Huntsville/Hytop, AL",
+    "KEOX":"Fort Rucker, AL","KMXX":"Maxwell AFB, AL","KMOB":"Mobile, AL",
+    "KGSP":"Greenville-Spartanburg/Greer, SC","KCAE":"Columbia, SC",
+    "KCLX":"Charleston, SC","KTLH":"Tallahassee, FL","KEVX":"Eglin AFB, FL",
+    "KTBW":"Tampa Bay/Ruskin, FL","KMLB":"Melbourne, FL","KAMX":"Miami, FL",
+    "KBYX":"Key West, FL","KJAX":"Jacksonville, FL",
+    "KDGX":"Jackson, MS","KGWX":"Columbus AFB, MS",
+    "KMRX":"Knoxville/Morristown, TN","KOHX":"Nashville, TN",
+    "KHPX":"Fort Campbell, KY","KJKL":"Jackson, KY",
+    "KRLX":"Charleston, WV","KFCX":"Blacksburg, VA","KAKQ":"Wakefield, VA",
+    "KRAX":"Raleigh, NC","KMHX":"Morehead City, NC","KLTX":"Wilmington, NC",
+    "KPOE":"Fort Polk, LA",
+}
+def normalize_nexrad_id(radar_id):
+    """Return a canonical four-character CONUS NEXRAD site ID."""
+    rid=str(radar_id or "").strip().upper()
+    if len(rid)==3 and rid.isalnum():
+        rid="K"+rid
+    return rid
+
+
+def nexrad_display_name(radar_id, metadata=None):
+    """Human-friendly radar label with an explicit city/state when available."""
+    rid=normalize_nexrad_id(radar_id)
+    metadata=metadata or {}
+    name=NEXRAD_DISPLAY_NAMES.get(rid)
+    if not name:
+        city=metadata.get("city") or metadata.get("location")
+        state=metadata.get("state") or metadata.get("st")
+        candidate=metadata.get("name")
+        if city:
+            name=f"{city}, {state}" if state else str(city)
+        elif candidate and normalize_nexrad_id(candidate)!=rid and str(candidate).upper()!=rid:
+            name=str(candidate)
+            if state and str(state).lower() not in name.lower():
+                name=f"{name}, {state}"
+    # Never silently render only an opaque radar ID; make missing metadata visible.
+    return f"{rid} — {name}" if name else f"{rid} — location unavailable"
+
+
 def nexrad_site_metadata():
-    """Return known NEXRAD locations, preferring Py-ART's national registry."""
-    out = {rid: {"name": name, "latitude": None, "longitude": None}
-           for rid, name in GPGL_NEXRAD_SITES.items()}
+    """Return known NEXRAD locations using canonical K-prefixed IDs.
+
+    Py-ART commonly exposes the national registry with three-character IDs
+    (for example MPX). ARIA normalizes those to KMPX before regional filtering
+    and labeling so non-GPGL profiles receive the same city/location metadata.
+    """
+    out = {
+        rid: {
+            "name": name,
+            "city": name.rsplit(",",1)[0] if "," in name else name,
+            "state": name.rsplit(",",1)[1].strip() if "," in name else None,
+            "latitude": None,
+            "longitude": None,
+        }
+        for rid, name in GPGL_NEXRAD_SITES.items()
+    }
     try:
         import pyart
         locations = pyart.io.nexrad_common.NEXRAD_LOCATIONS
-        for rid, meta in locations.items():
-            rid = str(rid).upper()
-            if not rid.startswith("K"):
+        for raw_id, meta in locations.items():
+            rid = normalize_nexrad_id(raw_id)
+            if len(rid)!=4 or not rid.startswith("K"):
                 continue
+            lat=lon=None
+            city=state=None
+            name=None
             if isinstance(meta, dict):
-                lat = meta.get("lat") or meta.get("latitude")
-                lon = meta.get("lon") or meta.get("longitude")
-                name = meta.get("name") or meta.get("city") or rid
+                lat = meta.get("lat") if meta.get("lat") is not None else meta.get("latitude")
+                lon = meta.get("lon") if meta.get("lon") is not None else meta.get("longitude")
+                city = meta.get("city") or meta.get("location")
+                state = meta.get("state") or meta.get("st")
+                name = meta.get("name")
             else:
                 try:
                     lat, lon = float(meta[0]), float(meta[1])
-                    name = rid
                 except Exception:
                     continue
-            out[rid] = {"name": str(name), "latitude": lat, "longitude": lon}
+                # Some Py-ART registry versions include a descriptive name
+                # after latitude/longitude.
+                if len(meta) > 2:
+                    name = meta[2]
+
+            preferred=NEXRAD_DISPLAY_NAMES.get(rid)
+            if preferred:
+                display=preferred
+                city=city or (preferred.rsplit(",",1)[0] if "," in preferred else preferred)
+                state=state or (preferred.rsplit(",",1)[1].strip() if "," in preferred else None)
+            elif city:
+                display=f"{city}, {state}" if state else str(city)
+            elif name and normalize_nexrad_id(name)!=rid:
+                display=str(name)
+                if state and str(state).lower() not in display.lower():
+                    display=f"{display}, {state}"
+            else:
+                display=None
+
+            out[rid] = {
+                "name": display or rid,
+                "city": city,
+                "state": state,
+                "latitude": lat,
+                "longitude": lon,
+            }
     except Exception:
         pass
     return out
@@ -302,6 +398,27 @@ class NEXRADLevel2Adapter:
             local_path=destination,
             scan_time=scan_time,
         )
+
+    def recent_scans(self, radar_id, *, when=None, lookback_minutes=60, max_scans=12):
+        radar_id=radar_id.upper(); when=when or datetime.now(timezone.utc)
+        when=when.replace(tzinfo=timezone.utc) if when.tzinfo is None else when.astimezone(timezone.utc)
+        earliest=when-timedelta(minutes=float(lookback_minutes)); candidates=[]
+        for day in sorted({when.date(),earliest.date()}):
+            day_dt=datetime(day.year,day.month,day.day,tzinfo=timezone.utc)
+            for key in self._list_keys(radar_id,day_dt):
+                scan_time=self._time_from_key(key)
+                if scan_time is not None and earliest<=scan_time<=when: candidates.append((scan_time,key))
+        candidates=sorted(set(candidates),key=lambda x:x[0])[-int(max_scans):]
+        return [NEXRADScan(radar_id=radar_id,site_name=nexrad_site_metadata().get(radar_id,{}).get("name",radar_id),key=key,local_path=self.cache_dir/Path(key).name,scan_time=scan_time) for scan_time,key in candidates]
+
+    def download_scan(self, scan):
+        destination=self.cache_dir/Path(scan.key).name
+        if not destination.exists():
+            response=requests.get(f"{self.bucket_url}/{scan.key}",timeout=self.timeout,stream=True); response.raise_for_status()
+            with destination.open("wb") as handle:
+                for chunk in response.iter_content(chunk_size=1024*1024):
+                    if chunk: handle.write(chunk)
+        return NEXRADScan(radar_id=scan.radar_id,site_name=scan.site_name,key=scan.key,local_path=destination,scan_time=scan.scan_time)
 
     def read(self, scan):
         try:
