@@ -12,25 +12,35 @@ The original Great Plains / Great Lakes (GPGL) domain remains a built-in region,
 but ARIA is region-agnostic and supports other predefined and user-defined
 domains.
 
-## Current release: v0.24.0
+## Current release: v0.25.0
 
-Integrated-analysis and radar usability patch.
+ARIA v0.25.0 expands persistent HRRR storage from a small F00 surface/radar subset
+into configurable regional forecast cubes intended for long-lived ARCO analysis.
 
-- Data Cube auto-refreshes local storage metadata every 5 minutes by default and adds a local-only Refresh now control.
-- NEXRAD site discovery normalizes Py-ART three-character IDs to canonical K-prefixed IDs and exposes explicit human-readable site labels.
-- Interactive single-radar state boundaries are black for better visibility.
-- PM2.5 and ozone monitoring-site overlays now honor Show station values and Show station IDs.
-- Radar environmental context adds Surface Stations, Contours, Shaded analysis, and Contours + stations modes with contour labels.
-- HRRR lead-time verification uses a conservative latest-complete valid time so just-started cycles and unpublished subset indexes are not treated as hard failures.
-- Standard HRRR↔Surface and HRRR↔MRMS difference products are generated from already-persisted local sources and stored under `derived/model_obs` when temporal matching criteria are met.
-- Individual NEXRAD persistence is now represented in storage profiles with Off/selected/all-region configuration groundwork. Native Radar DataTree/Icechunk writing remains deliberately guarded until the writer is enabled rather than silently duplicating raw Level-II files.
+- adds **Basic**, **Standard**, and **Full / Campaign** HRRR storage tiers
+- Standard persists selected leads (`F00/F01/F03/F06/F12` by default)
+- Standard adds pressure-level temperature, relative humidity, U/V wind, and
+  geopotential height at `1000/925/850/700/500/300/250 hPa`
+- Full / Campaign can persist hourly leads through F18, a denser vertical grid,
+  dew point, vertical velocity, surface pressure, and precipitation rate
+- writes separate Icechunk/Zarr v3 forecast cubes for surface, radar, and
+  pressure-level products using initialization time × forecast hour dimensions
+- retains the legacy `f00` store temporarily for dashboard compatibility
+- model-observation products now select the persisted HRRR member nearest the
+  observation valid time instead of comparing everything with the newest F00
+- radar upper-air overlays prefer the persistent pressure-level HRRR cube before
+  falling back to live Herbie retrieval
+- adds optional upper-air temperature or relative-humidity shading with its own
+  second colorbar, while geopotential-height contours and winds remain
+  independent overlays
+- standardizes new Icechunk time encoding to integer seconds since the Unix epoch
+  to avoid repeated append-time datetime encoding warnings
 
-The installed distribution and runtime version should both report `0.24.0`:
+The recommended default is **Standard**. It provides enough vertical structure
+and forecast-lead coverage for 3-D atmospheric analysis, radar environmental
+context, radiosonde/model comparison, and lead-time verification without the
+storage cost of a full HRRR archive.
 
-```bash
-python -m pip show aria-atmos
-python -c "import aria; print(aria.__version__)"
-```
 
 ## What ARIA does
 
@@ -177,6 +187,20 @@ This disclosure should be updated if materially different AI systems or model
 versions are used for future development.
 
 ## Release history
+
+## v0.24.0
+
+Integrated-analysis and radar usability patch.
+
+- Data Cube auto-refreshes local storage metadata every 5 minutes by default and adds a local-only Refresh now control.
+- NEXRAD site discovery normalizes Py-ART three-character IDs to canonical K-prefixed IDs and exposes explicit human-readable site labels.
+- Interactive single-radar state boundaries are black for better visibility.
+- PM2.5 and ozone monitoring-site overlays now honor Show station values and Show station IDs.
+- Radar environmental context adds Surface Stations, Contours, Shaded analysis, and Contours + stations modes with contour labels.
+- HRRR lead-time verification uses a conservative latest-complete valid time so just-started cycles and unpublished subset indexes are not treated as hard failures.
+- Standard HRRR↔Surface and HRRR↔MRMS difference products are generated from already-persisted local sources and stored under `derived/model_obs` when temporal matching criteria are met.
+- Individual NEXRAD persistence is now represented in storage profiles with Off/selected/all-region configuration groundwork. Native Radar DataTree/Icechunk writing remains deliberately guarded until the writer is enabled rather than silently duplicating raw Level-II files.
+
 
 ## v0.23.4
 
@@ -758,4 +782,3 @@ discovery.
 - Added Dask/Distributed compute infrastructure.
 - Added the `aria` CLI while retaining the legacy `gpgl` alias.
 - Migrated the source package itself to `aria/`.
-

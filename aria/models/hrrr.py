@@ -110,6 +110,12 @@ HRRR_PRESSURE_VARIABLES = {
         "units": "degC",
         "label": "Dew Point",
     },
+    "relative_humidity": {
+        "search": ":RH:[0-9]+ mb",
+        "candidates": ("r", "rh"),
+        "units": "%",
+        "label": "Relative Humidity",
+    },
     "u_wind": {
         "search": ":UGRD:[0-9]+ mb",
         "candidates": ("u",),

@@ -37,7 +37,16 @@ DEFAULT_ROOT = Path(os.environ.get("ARIA_STORAGE_ROOT", Path.home()/".local"/"sh
 DEFAULT_SOURCES = {
     "surface": {"enabled": True, "interval_minutes": 5},
     "mrms": {"enabled": True, "interval_minutes": 5},
-    "hrrr": {"enabled": True, "interval_minutes": 60},
+    "hrrr": {
+        "enabled": True,
+        "interval_minutes": 60,
+        # Basic: legacy F00 surface/radar fields only.
+        # Standard: selected forecast leads + curated pressure-level atmosphere.
+        # Full-Campaign: hourly leads through F18 + expanded pressure-level fields.
+        "storage_tier": "standard",
+        "forecast_hours": [0, 1, 3, 6, 12],
+        "pressure_levels_hpa": [1000, 925, 850, 700, 500, 300, 250],
+    },
     "air_quality": {"enabled": False, "interval_minutes": 30},
     "radiosonde": {"enabled": False, "interval_minutes": 60},
     "sst": {"enabled": False, "interval_minutes": 1440},
@@ -542,14 +551,34 @@ def _prepare_dataset_for_icechunk(ds: xr.Dataset, when=None) -> xr.Dataset:
     else:
         ds = ds.expand_dims(time=[stamp.to_datetime64()])
 
+    # Use one explicit, sufficiently fine CF time encoding for new stores.
+    # This avoids xarray/Icechunk repeatedly renegotiating inherited
+    # "days since ..." encodings when sub-hourly timestamps are appended.
+    if "time" in ds.coords:
+        try:
+            ds["time"].encoding.clear()
+            ds["time"].encoding.update({
+                "dtype": "int64",
+                "units": "seconds since 1970-01-01 00:00:00",
+                "calendar": "proleptic_gregorian",
+            })
+        except Exception:
+            pass
+
     ds.attrs["aria_storage_format"] = "icechunk_zarr_v3"
-    ds.attrs["aria_storage_schema"] = 3
+    ds.attrs["aria_storage_schema"] = 4
     return ds
 
 
 def _icechunk_encoding(ds: xr.Dataset) -> dict:
-    """Reasonable regional chunks: time-major with moderate spatial tiles."""
+    """Reasonable regional chunks with a stable explicit time encoding."""
     encoding = {}
+    if "time" in ds.coords:
+        encoding["time"] = {
+            "dtype": "int64",
+            "units": "seconds since 1970-01-01 00:00:00",
+            "calendar": "proleptic_gregorian",
+        }
     for name, var in ds.data_vars.items():
         chunks = []
         for dim, size in var.sizes.items():
@@ -958,6 +987,210 @@ def _write_frame(df: pd.DataFrame, directory: Path, stem: str, when=None) -> Pat
     return path
 
 
+
+HRRR_TIER_DEFAULTS = {
+    "basic": {
+        "forecast_hours": [0],
+        "pressure_levels_hpa": [],
+        "surface_variables": [
+            "air_temperature_2m", "dew_point_temperature_2m",
+            "u_wind_10m", "v_wind_10m",
+        ],
+        "radar_variables": ["composite_reflectivity", "reflectivity_1km"],
+        "pressure_variables": [],
+    },
+    "standard": {
+        "forecast_hours": [0, 1, 3, 6, 12],
+        "pressure_levels_hpa": [1000, 925, 850, 700, 500, 300, 250],
+        "surface_variables": [
+            "air_temperature_2m", "dew_point_temperature_2m",
+            "u_wind_10m", "v_wind_10m",
+        ],
+        "radar_variables": ["composite_reflectivity", "reflectivity_1km"],
+        "pressure_variables": [
+            "air_temperature", "relative_humidity",
+            "u_wind", "v_wind", "geopotential_height",
+        ],
+    },
+    "full_campaign": {
+        "forecast_hours": list(range(0, 19)),
+        "pressure_levels_hpa": [
+            1000, 950, 925, 900, 850, 800, 750, 700, 650, 600,
+            550, 500, 450, 400, 350, 300, 250, 200, 150, 100,
+        ],
+        "surface_variables": [
+            "air_temperature_2m", "dew_point_temperature_2m",
+            "u_wind_10m", "v_wind_10m", "surface_pressure",
+            "precipitation_rate",
+        ],
+        "radar_variables": ["composite_reflectivity", "reflectivity_1km"],
+        "pressure_variables": [
+            "air_temperature", "dew_point_temperature", "relative_humidity",
+            "u_wind", "v_wind", "geopotential_height", "vertical_velocity",
+        ],
+    },
+}
+
+
+def _hrrr_storage_settings(region) -> dict:
+    """Resolve one profile's HRRR storage tier with backward-compatible defaults."""
+    cfg=profile_for_region(region,require_enabled=False)
+    spec=(cfg or {}).get("sources",{}).get("hrrr",{})
+    tier=str(spec.get("storage_tier","standard")).strip().lower().replace("-","_")
+    if tier not in HRRR_TIER_DEFAULTS:
+        tier="standard"
+    settings=json.loads(json.dumps(HRRR_TIER_DEFAULTS[tier]))
+    if tier!="basic":
+        if spec.get("forecast_hours"):
+            settings["forecast_hours"]=sorted({
+                int(x) for x in spec["forecast_hours"] if 0 <= int(x) <= 48
+            })
+        if spec.get("pressure_levels_hpa"):
+            settings["pressure_levels_hpa"]=sorted({
+                int(x) for x in spec["pressure_levels_hpa"] if 50 <= int(x) <= 1100
+            }, reverse=True)
+    settings["tier"]=tier
+    return settings
+
+
+def _hrrr_member_for_cube(ds: xr.Dataset, run, forecast_hour: int) -> xr.Dataset:
+    """Normalize one HRRR member before concatenating it into a forecast cube."""
+    ds=ds.copy()
+    # Remove source scalar clock coordinates; ARIA stores initialization on the
+    # appendable time axis and valid time on the forecast-hour coordinate.
+    for name in ("time","step","valid_time"):
+        if name in ds.coords and name not in ds.dims:
+            try:
+                ds=ds.drop_vars(name)
+            except Exception:
+                pass
+    ds=ds.expand_dims(forecast_hour=[int(forecast_hour)])
+    ds=ds.assign_coords(
+        valid_time=(
+            "forecast_hour",
+            np.asarray([pd.Timestamp(run.valid_time).to_datetime64()],dtype="datetime64[ns]"),
+        )
+    )
+    ds["forecast_hour"].attrs.update({
+        "long_name":"Forecast lead time",
+        "units":"hours",
+    })
+    ds["valid_time"].attrs["long_name"]="Model valid time"
+    return ds
+
+
+def _concat_hrrr_members(members: list[xr.Dataset], *, tier: str, product: str) -> xr.Dataset:
+    if not members:
+        raise RuntimeError(f"No HRRR {product} forecast members were retrieved.")
+    ds=xr.concat(
+        members,
+        dim="forecast_hour",
+        data_vars="all",
+        coords="minimal",
+        compat="override",
+        join="outer",
+    ).sortby("forecast_hour")
+    ds.attrs.update({
+        "aria_hrrr_storage_tier":tier,
+        "aria_hrrr_product":product,
+        "aria_forecast_cube":"initialization_time × forecast_hour × spatial/vertical dimensions",
+    })
+    return ds
+
+
+def _subset_pressure_levels(ds: xr.Dataset, levels: list[int]) -> xr.Dataset:
+    if not levels or "pressure_hpa" not in ds.coords:
+        return ds
+    available=np.asarray(ds["pressure_hpa"].values,dtype=float)
+    wanted=[float(x) for x in levels]
+    keep=[]
+    for level in wanted:
+        if available.size:
+            idx=int(np.nanargmin(np.abs(available-level)))
+            if abs(float(available[idx])-level) <= 1.0:
+                keep.append(float(available[idx]))
+    keep=list(dict.fromkeys(keep))
+    return ds.sel(pressure_hpa=keep) if keep else ds.isel(pressure_hpa=slice(0,0))
+
+
+def _open_forecast_cube_latest(region, stem: str) -> xr.Dataset | None:
+    """Open the latest initialization from an HRRR forecast cube."""
+    return load_stored_dataset(region,"hrrr",stem,max_age_minutes=24*60)
+
+
+def _select_hrrr_valid_member(region, stem: str, target_time, *, max_offset_minutes=30):
+    """Select the persisted initialization/lead nearest a requested valid time."""
+    cfg=profile_for_region(region,require_enabled=False)
+    if cfg is None:
+        return None, None
+    path=_icechunk_repo_path(_source_dir(cfg,"hrrr"),stem)
+    if not path.exists():
+        return None, None
+    target=pd.Timestamp(target_time)
+    target=target.tz_localize("UTC") if target.tzinfo is None else target.tz_convert("UTC")
+    try:
+        import icechunk as ic
+        repo=ic.Repository.open(ic.local_filesystem_storage(str(path)))
+        session=repo.readonly_session("main")
+        opened=xr.open_zarr(session.store,consolidated=False,zarr_format=3,chunks=None)
+        if "time" not in opened.coords or "forecast_hour" not in opened.coords:
+            opened.close()
+            return None, None
+        inits=pd.to_datetime(opened["time"].values,utc=True,errors="coerce")
+        leads=np.asarray(opened["forecast_hour"].values,dtype=int)
+        best=None
+        for ti,init in enumerate(inits):
+            if pd.isna(init):
+                continue
+            for fi,lead in enumerate(leads):
+                valid=pd.Timestamp(init)+pd.Timedelta(hours=int(lead))
+                offset=abs((valid-target).total_seconds())/60.0
+                if best is None or offset < best[0]:
+                    best=(offset,ti,fi,pd.Timestamp(init),int(lead),valid)
+        if best is None or best[0] > float(max_offset_minutes):
+            opened.close()
+            return None, None
+        offset,ti,fi,init,lead,valid=best
+        member=opened.isel(time=ti,forecast_hour=fi).load()
+        opened.close()
+        meta={
+            "initialization_time":init,
+            "forecast_hour":lead,
+            "valid_time":valid,
+            "offset_minutes":float((valid-target).total_seconds()/60.0),
+        }
+        return member,meta
+    except Exception:
+        return None,None
+
+
+
+def load_stored_hrrr_valid_member(
+    region,
+    product: str,
+    target_time,
+    *,
+    max_offset_minutes: float = 30,
+):
+    """Public local-first selector for persisted HRRR forecast cubes.
+
+    ``product`` is one of ``surface``, ``radar``, or ``pressure``.
+    Returns ``(dataset, match_metadata)`` or ``(None, None)``.
+    """
+    stems={
+        "surface":"surface_forecast",
+        "radar":"radar_forecast",
+        "pressure":"pressure_forecast",
+    }
+    key=str(product).lower()
+    if key not in stems:
+        raise ValueError(f"Unknown HRRR forecast-cube product: {product}")
+    return _select_hrrr_valid_member(
+        region,stems[key],target_time,
+        max_offset_minutes=max_offset_minutes,
+    )
+
+
 def _collect(source: str, region, directory: Path) -> dict:
     """Run one source adapter/workflow and persist a snapshot."""
     from . import workflows
@@ -975,10 +1208,85 @@ def _collect(source: str, region, directory: Path) -> dict:
         data_time = pd.Timestamp(scan_time)
         files.append(str(_write_dataset(ds, directory, "reflectivity", data_time)))
     elif source == "hrrr":
-        variables = ["air_temperature_2m", "dew_point_temperature_2m", "u_wind_10m", "v_wind_10m", "composite_reflectivity", "reflectivity_1km"]
-        ds, run = workflows.build_hrrr_surface(region=region, forecast_hour=0, variables=variables)
-        data_time = pd.Timestamp(run.valid_time)
-        files.append(str(_write_dataset(ds, directory, "f00", data_time)))
+        settings=_hrrr_storage_settings(region)
+        tier=settings["tier"]
+        leads=settings["forecast_hours"]
+
+        # Use one initialization cycle for every lead in this collector run.
+        # build_hrrr_surface(None, F00) resolves the newest conservatively
+        # available initialization; subsequent members explicitly reuse it.
+        base_vars=list(dict.fromkeys(
+            settings["surface_variables"]+settings["radar_variables"]
+        ))
+        f00,base_run=workflows.build_hrrr_surface(
+            region=region,forecast_hour=0,variables=base_vars
+        )
+        cycle=pd.Timestamp(base_run.initialization_time)
+        data_time=cycle
+
+        surface_members=[]
+        radar_members=[]
+        pressure_members=[]
+
+        for fxx in leads:
+            if int(fxx)==0:
+                surface_raw=f00[[
+                    v for v in settings["surface_variables"] if v in f00
+                ]]
+                radar_raw=f00[[
+                    v for v in settings["radar_variables"] if v in f00
+                ]]
+                run=base_run
+            else:
+                surface_raw,run=workflows.build_hrrr_surface(
+                    region=region,cycle=cycle,forecast_hour=int(fxx),
+                    variables=settings["surface_variables"],
+                )
+                radar_raw,_=workflows.build_hrrr_surface(
+                    region=region,cycle=cycle,forecast_hour=int(fxx),
+                    variables=settings["radar_variables"],
+                )
+
+            surface_members.append(_hrrr_member_for_cube(surface_raw,run,int(fxx)))
+            radar_members.append(_hrrr_member_for_cube(radar_raw,run,int(fxx)))
+
+            if settings["pressure_variables"]:
+                pressure_raw,pressure_run=workflows.build_hrrr_pressure(
+                    region=region,cycle=cycle,forecast_hour=int(fxx),
+                    variables=settings["pressure_variables"],
+                )
+                pressure_raw=_subset_pressure_levels(
+                    pressure_raw,settings["pressure_levels_hpa"]
+                )
+                pressure_members.append(
+                    _hrrr_member_for_cube(pressure_raw,pressure_run,int(fxx))
+                )
+
+        surface_cube=_concat_hrrr_members(
+            surface_members,tier=tier,product="surface"
+        )
+        radar_cube=_concat_hrrr_members(
+            radar_members,tier=tier,product="radar"
+        )
+        files.append(str(_write_dataset(
+            surface_cube,directory,"surface_forecast",cycle
+        )))
+        files.append(str(_write_dataset(
+            radar_cube,directory,"radar_forecast",cycle
+        )))
+
+        if pressure_members:
+            pressure_cube=_concat_hrrr_members(
+                pressure_members,tier=tier,product="pressure"
+            )
+            files.append(str(_write_dataset(
+                pressure_cube,directory,"pressure_forecast",cycle
+            )))
+
+        # Transitional compatibility store used by existing dashboard readers.
+        # It contains only F00 and can be retired once all readers select from
+        # surface_forecast/radar_forecast.
+        files.append(str(_write_dataset(f00,directory,"f00",base_run.valid_time)))
     elif source == "air_quality":
         ds, latest, observations, latest_time = workflows.build_latest_air_quality(region=region, max_distance_km=300.0)
         data_time = pd.Timestamp(latest_time)
@@ -1017,10 +1325,9 @@ def _collect(source: str, region, directory: Path) -> dict:
         # prevents the collector from silently making another network request.
         from .integrated import build_surface_difference, build_radar_difference
 
-        model=load_stored_dataset(region,"hrrr","f00",max_age_minutes=180)
-        if model is None:
-            raise RuntimeError("HRRR persistent data are not current enough for model–observation differences.")
-
+        # Model members are selected by observation valid time from the
+        # persisted forecast cubes rather than comparing observations with
+        # whichever F00 happens to be newest.
         def _ds_time(ds, attr_names=()):
             if ds is None:
                 return None
@@ -1036,18 +1343,16 @@ def _collect(source: str, region, directory: Path) -> dict:
                     return stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
             return None
 
-        model_time=_ds_time(model,("valid_time",))
-        if model_time is None:
-            raise RuntimeError("Stored HRRR data do not expose a usable valid time.")
-
         built=0
         failures=[]
 
-        surface=load_stored_dataset(region,"surface","analysis",max_age_minutes=30)
+        surface=load_stored_dataset(region,"surface","analysis",max_age_minutes=120)
         surface_time=_ds_time(surface)
         if surface is not None and surface_time is not None:
-            offset=abs((surface_time-model_time).total_seconds())/60.0
-            if offset <= 30.0:
+            model,match=_select_hrrr_valid_member(
+                region,"surface_forecast",surface_time,max_offset_minutes=30
+            )
+            if model is not None and match is not None:
                 for model_variable,stem in (
                     ("air_temperature_2m","hrrr_surface_temperature"),
                     ("dew_point_temperature_2m","hrrr_surface_dew_point"),
@@ -1060,41 +1365,56 @@ def _collect(source: str, region, directory: Path) -> dict:
                             "aria_derived_product":"model_observation_difference",
                             "model_source":"HRRR",
                             "observation_source":"ARIA surface analysis",
-                            "model_valid_time":model_time.isoformat(),
+                            "model_initialization_time":match["initialization_time"].isoformat(),
+                            "forecast_hour":int(match["forecast_hour"]),
+                            "model_valid_time":match["valid_time"].isoformat(),
                             "observation_time":surface_time.isoformat(),
-                            "observation_offset_minutes":float((surface_time-model_time).total_seconds()/60.0),
-                            "matching_rule":"absolute time offset <= 30 minutes",
+                            "observation_offset_minutes":float(match["offset_minutes"]),
+                            "matching_rule":"nearest persisted HRRR valid time within 30 minutes",
                         })
-                        files.append(str(_write_dataset(comp,directory,stem,model_time)))
+                        files.append(str(_write_dataset(
+                            comp,directory,stem,match["valid_time"]
+                        )))
                         built+=1
                     except Exception as exc:
                         failures.append(f"{stem}: {exc}")
 
-        mrms=load_stored_dataset(region,"mrms","reflectivity",max_age_minutes=30)
+        mrms=load_stored_dataset(region,"mrms","reflectivity",max_age_minutes=120)
         mrms_time=_ds_time(mrms,("analysis_time",))
-        if mrms is not None and mrms_time is not None and "composite_reflectivity" in model:
-            offset=abs((mrms_time-model_time).total_seconds())/60.0
-            if offset <= 30.0:
+        if mrms is not None and mrms_time is not None:
+            model,match=_select_hrrr_valid_member(
+                region,"radar_forecast",mrms_time,max_offset_minutes=30
+            )
+            if model is not None and match is not None and "composite_reflectivity" in model:
                 try:
-                    comp=build_radar_difference(model,mrms,model_variable="composite_reflectivity")
+                    comp=build_radar_difference(
+                        model,mrms,model_variable="composite_reflectivity"
+                    )
                     comp.attrs.update({
                         "aria_derived_product":"model_observation_difference",
                         "model_source":"HRRR",
                         "observation_source":"MRMS QC Composite",
-                        "model_valid_time":model_time.isoformat(),
+                        "model_initialization_time":match["initialization_time"].isoformat(),
+                        "forecast_hour":int(match["forecast_hour"]),
+                        "model_valid_time":match["valid_time"].isoformat(),
                         "observation_time":mrms_time.isoformat(),
-                        "observation_offset_minutes":float((mrms_time-model_time).total_seconds()/60.0),
-                        "matching_rule":"absolute time offset <= 30 minutes",
+                        "observation_offset_minutes":float(match["offset_minutes"]),
+                        "matching_rule":"nearest persisted HRRR valid time within 30 minutes",
                     })
-                    files.append(str(_write_dataset(comp,directory,"hrrr_mrms_reflectivity",model_time)))
+                    files.append(str(_write_dataset(
+                        comp,directory,"hrrr_mrms_reflectivity",match["valid_time"]
+                    )))
                     built+=1
                 except Exception as exc:
                     failures.append(f"hrrr_mrms_reflectivity: {exc}")
 
+        data_time=max(
+            [x for x in (surface_time,mrms_time) if x is not None],
+            default=pd.Timestamp.now(tz="UTC"),
+        )
         if not built:
             detail="; ".join(failures) if failures else "no locally persisted source pairs met the 30-minute matching criterion"
             raise RuntimeError(f"No model–observation products were generated: {detail}")
-        data_time=model_time
     elif source == "nexrad":
         from .adapters.nexrad import nexrad_sites_for_region
         spec = load_config().get("sources", {}).get("nexrad", {})

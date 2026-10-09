@@ -23,7 +23,7 @@ from aria.storage import (
     SOURCE_NATIVE_CADENCE, load_stored_dataset, load_stored_dataset_history, load_stored_time_range,
     load_stored_frame, storage_matches_region, list_storage_profiles,
     create_storage_profile, set_active_profile, all_status_rows, profile_for_region,
-    source_time_coverage,
+    source_time_coverage, load_stored_hrrr_valid_member,
 )
 from aria.history import historical_plan
 from aria.storm_objects import adapt_available, adapt_version, segment_with_adapt, summarize_objects
@@ -643,10 +643,32 @@ def load_hrrr_pressure(region_key, cycle_iso, forecast_hour, variables):
 
 @st.cache_data(ttl=1800,show_spinner=False)
 def load_hrrr_environment(region_key, target_time_iso, pressure_hpa, variables):
-    """Load an HRRR pressure-level environment matched to a radar valid time."""
+    """Load HRRR upper-air context, preferring the persistent forecast cube."""
     target=pd.Timestamp(target_time_iso)
     target=target.tz_localize("UTC") if target.tzinfo is None else target.tz_convert("UTC")
     valid=target.floor("1h")
+
+    stored,match=load_stored_hrrr_valid_member(
+        ACTIVE_REGION,"pressure",valid,max_offset_minutes=30
+    )
+    if stored is not None and match is not None:
+        keep=[v for v in variables if v in stored]
+        if keep:
+            ds=stored[keep]
+            if "pressure_hpa" in ds.coords:
+                ds=ds.sel(pressure_hpa=float(pressure_hpa),method="nearest")
+            from aria.models.base import ModelRun
+            run=ModelRun(
+                model="hrrr",
+                initialization_time=pd.Timestamp(match["initialization_time"]),
+                forecast_hour=int(match["forecast_hour"]),
+                valid_time=pd.Timestamp(match["valid_time"]),
+                source="ARIA persistent HRRR pressure forecast cube",
+                product="prs",
+            )
+            return ds,run
+
+    # Fallback for profiles that have not yet accumulated the pressure cube.
     cycles=hrrr_available_cycles(count=24)
     candidates=[]
     for cycle in cycles:
@@ -1046,6 +1068,90 @@ if view=="Data Storage":
             spec["enabled"]=a.checkbox(SOURCE_LABELS.get(key,key),value=bool(spec.get("enabled",False)),key=f"store-enable-{selected_profile}-{key}")
             spec["interval_minutes"]=int(b.selectbox("Check interval",options,index=options.index(current),format_func=_interval_label,key=f"store-interval-{selected_profile}-{key}",label_visibility="collapsed"))
             c.caption(SOURCE_NATIVE_CADENCE.get(key,""))
+
+        if "hrrr" in working:
+            hrrr_spec=working["hrrr"]
+            st.markdown("##### HRRR regional forecast cube")
+            st.caption(
+                "Choose how much HRRR is persistently collected for this regional profile. "
+                "Standard is the recommended ARIA data-cube configuration."
+            )
+            _tier_label={
+                "basic":"Basic",
+                "standard":"Standard",
+                "full_campaign":"Full / Campaign",
+            }
+            _tier_reverse={v:k for k,v in _tier_label.items()}
+            _current_tier=str(hrrr_spec.get("storage_tier","standard")).lower().replace("-","_")
+            if _current_tier not in _tier_label:
+                _current_tier="standard"
+            _chosen=st.selectbox(
+                "HRRR storage tier",
+                list(_tier_reverse),
+                index=list(_tier_reverse).index(_tier_label[_current_tier]),
+                key=f"store-hrrr-tier-{selected_profile}",
+            )
+            hrrr_spec["storage_tier"]=_tier_reverse[_chosen]
+
+            if hrrr_spec["storage_tier"]=="basic":
+                hrrr_spec["forecast_hours"]=[0]
+                hrrr_spec["pressure_levels_hpa"]=[]
+                st.caption(
+                    "Basic: F00 surface fields and radar reflectivity only. "
+                    "No persistent pressure-level atmosphere."
+                )
+            else:
+                _default_leads=(
+                    [0,1,3,6,12]
+                    if hrrr_spec["storage_tier"]=="standard"
+                    else list(range(0,19))
+                )
+                _current_leads=[
+                    int(x) for x in hrrr_spec.get("forecast_hours",_default_leads)
+                    if 0 <= int(x) <= 18
+                ]
+                hrrr_spec["forecast_hours"]=st.multiselect(
+                    "Forecast leads to persist",
+                    list(range(0,19)),
+                    default=_current_leads or _default_leads,
+                    format_func=lambda x:f"F{x:02d}",
+                    key=f"store-hrrr-leads-{selected_profile}",
+                )
+
+                _standard_levels=[1000,925,850,700,500,300,250]
+                _full_levels=[
+                    1000,950,925,900,850,800,750,700,650,600,
+                    550,500,450,400,350,300,250,200,150,100,
+                ]
+                _level_options=_full_levels
+                _level_default=(
+                    _standard_levels
+                    if hrrr_spec["storage_tier"]=="standard"
+                    else _full_levels
+                )
+                _current_levels=[
+                    int(x) for x in hrrr_spec.get("pressure_levels_hpa",_level_default)
+                    if int(x) in _level_options
+                ]
+                hrrr_spec["pressure_levels_hpa"]=st.multiselect(
+                    "Pressure levels to persist",
+                    _level_options,
+                    default=_current_levels or _level_default,
+                    format_func=lambda x:f"{x} hPa",
+                    key=f"store-hrrr-levels-{selected_profile}",
+                )
+                if hrrr_spec["storage_tier"]=="standard":
+                    st.caption(
+                        "Standard variables: 2-m temperature/dew point, 10-m winds, "
+                        "composite and 1-km reflectivity; pressure-level temperature, "
+                        "RH, U/V wind, and geopotential height."
+                    )
+                else:
+                    st.caption(
+                        "Full / Campaign additionally stores hourly F00–F18 by default, "
+                        "more pressure levels, dew point, vertical velocity, surface "
+                        "pressure, and precipitation rate. Storage/network use can be substantial."
+                    )
 
         if "nexrad" in working:
             nex=working["nexrad"]
@@ -1898,24 +2004,61 @@ elif view=="Radar":
             st.sidebar.markdown("#### Environment")
             env_mode=st.sidebar.selectbox("Environmental overlay",["None","HRRR upper air","Surface observations","HRRR + Surface"],key=f"radar-env-mode-{rid}")
             env_ds=None; env_run=None; env_obs=None; env_surface_ds=None
-            env_pressure=500; env_temp=True; env_wind=True; env_height=False; env_density="Medium"; env_temp_interval=2.0; env_height_interval=60.0
+            env_pressure=500; env_temp=False; env_wind=True; env_height=True; env_density="Medium"; env_temp_interval=2.0; env_height_interval=60.0
+            env_shaded_field="Temperature"; env_shading_opacity=0.28
             surface_env_mode="Stations"; surface_env_variable="air_temperature_f"; surface_env_labels=True; surface_env_opacity=0.30
             if "HRRR" in env_mode:
                 env_pressure=st.sidebar.selectbox("Pressure level",[850,700,500,300],index=2,key=f"radar-env-level-{rid}")
-                env_temp=st.sidebar.checkbox("Temperature contours",True,key=f"radar-env-temp-{rid}")
-                env_temp_interval=st.sidebar.selectbox("Temperature contour interval",[1.0,2.0,5.0,10.0],index=1,format_func=lambda v:f"{v:g} °C",key=f"radar-env-temp-step-{rid}") if env_temp else 2.0
-                env_wind=st.sidebar.checkbox("Wind barbs/arrows",True,key=f"radar-env-wind-{rid}")
-                env_height=st.sidebar.checkbox("Geopotential-height contours",False,key=f"radar-env-height-{rid}")
-                env_height_interval=st.sidebar.selectbox("Height contour interval",[30.0,60.0,120.0],index=1,format_func=lambda v:f"{v:g} m",key=f"radar-env-height-step-{rid}") if env_height else 60.0
-                env_density=st.sidebar.selectbox("Wind density",["Sparse","Medium","Dense"],index=1,key=f"radar-env-density-{rid}")
+                env_shaded_field=st.sidebar.selectbox(
+                    "Environmental shading",
+                    ["None","Temperature","Relative humidity"],
+                    index=1,key=f"radar-env-shaded-{rid}",
+                )
+                if env_shaded_field!="None":
+                    env_shading_opacity=st.sidebar.slider(
+                        "Environmental shading opacity",0.10,0.55,0.28,0.05,
+                        key=f"radar-env-shading-opacity-{rid}",
+                    )
+                env_temp=st.sidebar.checkbox(
+                    "Temperature line contours",False,key=f"radar-env-temp-{rid}"
+                )
+                env_temp_interval=st.sidebar.selectbox(
+                    "Temperature contour interval",[1.0,2.0,5.0,10.0],index=1,
+                    format_func=lambda v:f"{v:g} °C",
+                    key=f"radar-env-temp-step-{rid}",
+                ) if env_temp else 2.0
+                env_height=st.sidebar.checkbox(
+                    "Geopotential-height contours",True,key=f"radar-env-height-{rid}"
+                )
+                env_height_interval=st.sidebar.selectbox(
+                    "Height contour interval",[30.0,60.0,120.0],index=1,
+                    format_func=lambda v:f"{v:g} m",
+                    key=f"radar-env-height-step-{rid}",
+                ) if env_height else 60.0
+                env_wind=st.sidebar.checkbox(
+                    "Wind barbs/arrows",True,key=f"radar-env-wind-{rid}"
+                )
+                env_density=st.sidebar.selectbox(
+                    "Wind density",["Sparse","Medium","Dense"],index=1,
+                    key=f"radar-env-density-{rid}"
+                )
                 env_vars=[]
-                if env_temp: env_vars.append("air_temperature")
-                if env_wind: env_vars.extend(["u_wind","v_wind"])
-                if env_height: env_vars.append("geopotential_height")
+                if env_shaded_field=="Temperature" or env_temp:
+                    env_vars.append("air_temperature")
+                if env_shaded_field=="Relative humidity":
+                    env_vars.append("relative_humidity")
+                if env_wind:
+                    env_vars.extend(["u_wind","v_wind"])
+                if env_height:
+                    env_vars.append("geopotential_height")
+                env_vars=list(dict.fromkeys(env_vars))
                 if env_vars:
                     try:
                         with st.spinner(f"Matching {env_pressure}-hPa HRRR environment to radar time..."):
-                            env_ds,env_run=load_hrrr_environment(REGION_CACHE_KEY,pd.Timestamp(scan.scan_time).isoformat(),env_pressure,tuple(env_vars))
+                            env_ds,env_run=load_hrrr_environment(
+                                REGION_CACHE_KEY,pd.Timestamp(scan.scan_time).isoformat(),
+                                env_pressure,tuple(env_vars)
+                            )
                     except Exception as exc:
                         st.warning(f"HRRR environmental overlay unavailable: {exc}")
             if "Surface" in env_mode:
@@ -2002,7 +2145,13 @@ elif view=="Radar":
                     adapt_labels=adapt_labels,
                 )
                 if env_ds is not None:
-                    add_mpl_environment_overlay(fig.axes[0],env_ds,ACTIVE_REGION,pressure_hpa=env_pressure,show_temperature=env_temp,show_wind=env_wind,show_height=env_height,wind_density=env_density,temperature_interval=env_temp_interval,height_interval=env_height_interval)
+                    add_mpl_environment_overlay(
+                        fig.axes[0],env_ds,ACTIVE_REGION,pressure_hpa=env_pressure,
+                        show_temperature=env_temp,show_wind=env_wind,show_height=env_height,
+                        wind_density=env_density,temperature_interval=env_temp_interval,
+                        height_interval=env_height_interval,shaded_field=env_shaded_field,
+                        shading_opacity=env_shading_opacity,
+                    )
                 if env_surface_ds is not None and surface_env_mode!="Stations":
                     _add_surface_analysis_overlay_mpl(
                         fig.axes[0],env_surface_ds,surface_env_variable,surface_env_mode,
@@ -2020,7 +2169,13 @@ elif view=="Radar":
                     adapt_labels=adapt_labels,
                 )
                 if env_ds is not None:
-                    fig=add_interactive_environment_overlay(fig,env_ds,ACTIVE_REGION,pressure_hpa=env_pressure,show_temperature=env_temp,show_wind=env_wind,show_height=env_height,wind_density=env_density,temperature_interval=env_temp_interval,height_interval=env_height_interval)
+                    fig=add_interactive_environment_overlay(
+                        fig,env_ds,ACTIVE_REGION,pressure_hpa=env_pressure,
+                        show_temperature=env_temp,show_wind=env_wind,show_height=env_height,
+                        wind_density=env_density,temperature_interval=env_temp_interval,
+                        height_interval=env_height_interval,shaded_field=env_shaded_field,
+                        shading_opacity=env_shading_opacity,
+                    )
                 if env_surface_ds is not None and surface_env_mode!="Stations":
                     fig=_add_surface_analysis_overlay_plotly(
                         fig,env_surface_ds,surface_env_variable,surface_env_mode,
@@ -2037,7 +2192,13 @@ elif view=="Radar":
                     adapt_labels=adapt_labels,
                 )
                 if env_ds is not None:
-                    add_mpl_environment_overlay(fig.axes[0],env_ds,ACTIVE_REGION,pressure_hpa=env_pressure,show_temperature=env_temp,show_wind=env_wind,show_height=env_height,wind_density=env_density,temperature_interval=env_temp_interval,height_interval=env_height_interval)
+                    add_mpl_environment_overlay(
+                        fig.axes[0],env_ds,ACTIVE_REGION,pressure_hpa=env_pressure,
+                        show_temperature=env_temp,show_wind=env_wind,show_height=env_height,
+                        wind_density=env_density,temperature_interval=env_temp_interval,
+                        height_interval=env_height_interval,shaded_field=env_shaded_field,
+                        shading_opacity=env_shading_opacity,
+                    )
                 if env_surface_ds is not None and surface_env_mode!="Stations":
                     _add_surface_analysis_overlay_mpl(
                         fig.axes[0],env_surface_ds,surface_env_variable,surface_env_mode,

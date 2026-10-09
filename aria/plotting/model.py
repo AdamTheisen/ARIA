@@ -616,10 +616,16 @@ def add_interactive_wind_overlay(fig,u_da,v_da,region,*,mode="Arrows",density="M
 
 def add_interactive_environment_overlay(
     fig, ds, region, *, pressure_hpa=500,
-    show_temperature=True, show_wind=True, show_height=False,
+    show_temperature=False, show_wind=True, show_height=True,
     wind_density="Medium", temperature_interval=2.0, height_interval=60.0,
+    shaded_field="None", shading_opacity=0.28,
 ):
-    """Overlay HRRR upper-air context on an existing Plotly geographic map."""
+    """Overlay HRRR upper-air context on an existing Plotly geographic map.
+
+    Reflectivity remains the primary map field. One environmental variable can
+    be shown as semi-transparent shading with its own colorbar, while height
+    contours and winds provide independent structural context.
+    """
     import plotly.graph_objects as go
     level=float(pressure_hpa)
 
@@ -631,6 +637,52 @@ def add_interactive_environment_overlay(
             da=da.sel(pressure_hpa=level,method="nearest")
         return da.squeeze(drop=True)
 
+    shade=str(shaded_field or "None").lower()
+    if shade not in ("none","off"):
+        if shade.startswith("temp"):
+            da=_level("air_temperature")
+            label=f"{int(level)} hPa Temperature"
+            units="°C"
+            colorscale="RdBu_r"
+            zmin=zmax=None
+        elif shade.startswith("relative") or shade in ("rh","humidity"):
+            da=_level("relative_humidity")
+            label=f"{int(level)} hPa Relative Humidity"
+            units="%"
+            colorscale="Viridis"
+            zmin,zmax=0.0,100.0
+        else:
+            da=None
+        if da is not None:
+            x,y,z=_regularize_interactive_da(da,max_points=220)
+            finite=z[np.isfinite(z)]
+            if finite.size:
+                if zmin is None:
+                    lo=float(np.nanpercentile(finite,2))
+                    hi=float(np.nanpercentile(finite,98))
+                    pad=max((hi-lo)*0.05,0.5)
+                    zmin,zmax=lo-pad,hi+pad
+                fig.add_trace(go.Heatmap(
+                    x=x,y=y,z=z,zmin=zmin,zmax=zmax,
+                    colorscale=colorscale,
+                    opacity=float(shading_opacity),
+                    name=label,
+                    colorbar=dict(
+                        title=f"{label}<br>{units}",
+                        x=1.13,
+                        len=0.62,
+                        thickness=14,
+                    ),
+                    hovertemplate=(
+                        f"{label}<br>Lon %{{x:.2f}}<br>Lat %{{y:.2f}}"
+                        f"<br>%{{z:.1f}} {units}<extra></extra>"
+                    ),
+                    showscale=True,
+                ))
+                fig.update_layout(margin=dict(r=150))
+
+    # Optional temperature line contours remain available independently of the
+    # shaded environmental field.
     if show_temperature:
         temp=_level("air_temperature")
         if temp is not None:
@@ -643,8 +695,11 @@ def add_interactive_environment_overlay(
                 if hi<=lo: hi=lo+step
                 fig.add_trace(go.Contour(
                     x=x,y=y,z=z,showscale=False,hoverinfo="skip",
-                    contours=dict(start=lo,end=hi,size=step,coloring="none"),
-                    line=dict(color="rgba(180,35,35,.90)",width=1.4),
+                    contours=dict(
+                        start=lo,end=hi,size=step,coloring="none",
+                        showlabels=True,labelfont=dict(size=9,color="firebrick"),
+                    ),
+                    line=dict(color="rgba(180,35,35,.85)",width=1.1),
                     name=f"{int(level)} hPa temperature",showlegend=False,
                 ))
 
@@ -660,24 +715,29 @@ def add_interactive_environment_overlay(
                 if hi<=lo: hi=lo+step
                 fig.add_trace(go.Contour(
                     x=x,y=y,z=z,showscale=False,hoverinfo="skip",
-                    contours=dict(start=lo,end=hi,size=step,coloring="none"),
-                    line=dict(color="rgba(30,30,30,.80)",width=1.1),
+                    contours=dict(
+                        start=lo,end=hi,size=step,coloring="none",
+                        showlabels=True,labelfont=dict(size=9,color="black"),
+                    ),
+                    line=dict(color="rgba(25,25,25,.90)",width=1.3),
                     name=f"{int(level)} hPa height",showlegend=False,
                 ))
 
     if show_wind:
         u=_level("u_wind"); v=_level("v_wind")
         if u is not None and v is not None:
-            fig=add_interactive_wind_overlay(fig,u,v,region,mode="Arrows",density=wind_density)
+            fig=add_interactive_wind_overlay(
+                fig,u,v,region,mode="Arrows",density=wind_density
+            )
     return fig
-
 
 def add_mpl_environment_overlay(
     ax, ds, region, *, pressure_hpa=500,
-    show_temperature=True, show_wind=True, show_height=False,
+    show_temperature=False, show_wind=True, show_height=True,
     wind_density="Medium", temperature_interval=2.0, height_interval=60.0,
+    shaded_field="None", shading_opacity=0.28,
 ):
-    """Overlay HRRR upper-air contours and wind barbs on a Cartopy axis."""
+    """Overlay HRRR upper-air shading, contours and wind on a Cartopy axis."""
     level=float(pressure_hpa)
 
     def _level(name):
@@ -690,7 +750,36 @@ def add_mpl_environment_overlay(
 
     def _geo(da):
         if da is None: return None,None,None
-        return np.asarray(da.longitude.values,float),np.asarray(da.latitude.values,float),np.asarray(da.values,float)
+        return (
+            np.asarray(da.longitude.values,float),
+            np.asarray(da.latitude.values,float),
+            np.asarray(da.values,float),
+        )
+
+    shade=str(shaded_field or "None").lower()
+    if shade not in ("none","off"):
+        if shade.startswith("temp"):
+            da=_level("air_temperature"); units="°C"; cmap="coolwarm"
+            vmin=vmax=None
+            cb_label=f"{int(level)} hPa Temperature ({units})"
+        elif shade.startswith("relative") or shade in ("rh","humidity"):
+            da=_level("relative_humidity"); units="%"; cmap="viridis"
+            vmin,vmax=0.0,100.0
+            cb_label=f"{int(level)} hPa Relative Humidity ({units})"
+        else:
+            da=None
+        lon,lat,z=_geo(da)
+        if z is not None and np.isfinite(z).any():
+            mesh=ax.pcolormesh(
+                lon,lat,z,cmap=cmap,vmin=vmin,vmax=vmax,
+                alpha=float(shading_opacity),
+                shading="auto",transform=ccrs.PlateCarree(),zorder=4,
+            )
+            try:
+                cb=ax.figure.colorbar(mesh,ax=ax,pad=.02,fraction=.035)
+                cb.set_label(cb_label)
+            except Exception:
+                pass
 
     if show_temperature:
         da=_level("air_temperature"); lon,lat,z=_geo(da)
@@ -700,7 +789,11 @@ def add_mpl_environment_overlay(
             lo=np.floor(np.nanmin(vals)/step)*step
             hi=np.ceil(np.nanmax(vals)/step)*step
             if hi<=lo: hi=lo+step
-            cs=ax.contour(lon,lat,z,levels=np.arange(lo,hi+step*0.5,step),colors="firebrick",linewidths=1.0,alpha=.9,transform=ccrs.PlateCarree(),zorder=6)
+            cs=ax.contour(
+                lon,lat,z,levels=np.arange(lo,hi+step*0.5,step),
+                colors="firebrick",linewidths=1.0,alpha=.9,
+                transform=ccrs.PlateCarree(),zorder=6,
+            )
             try: ax.clabel(cs,fmt="%g°C",fontsize=7,inline=True)
             except Exception: pass
 
@@ -711,24 +804,36 @@ def add_mpl_environment_overlay(
             lo=np.floor(np.nanmin(vals)/step)*step
             hi=np.ceil(np.nanmax(vals)/step)*step
             if hi<=lo: hi=lo+step
-            cs=ax.contour(lon,lat,z,levels=np.arange(lo,hi+step/2,step),colors="black",linewidths=.8,alpha=.75,transform=ccrs.PlateCarree(),zorder=6)
+            cs=ax.contour(
+                lon,lat,z,levels=np.arange(lo,hi+step/2,step),
+                colors="black",linewidths=.9,alpha=.9,
+                transform=ccrs.PlateCarree(),zorder=6,
+            )
             try: ax.clabel(cs,fmt="%g",fontsize=7,inline=True)
             except Exception: pass
 
     if show_wind:
         u=_level("u_wind"); v=_level("v_wind")
         if u is not None and v is not None:
-            lon=np.asarray(u.longitude.values,float); lat=np.asarray(u.latitude.values,float)
-            uu=np.asarray(u.values,float)*1.94384; vv=np.asarray(v.values,float)*1.94384
+            lon=np.asarray(u.longitude.values,float)
+            lat=np.asarray(u.latitude.values,float)
+            uu=np.asarray(u.values,float)*1.94384
+            vv=np.asarray(v.values,float)*1.94384
             skip={"Sparse":28,"Medium":20,"Dense":14}.get(str(wind_density),20)
             if lon.ndim==2 and lat.ndim==2:
                 sl=(slice(None,None,skip),slice(None,None,skip))
-                ax.barbs(lon[sl],lat[sl],uu[sl],vv[sl],length=4.5,linewidth=.45,color="black",transform=ccrs.PlateCarree(),zorder=7)
+                ax.barbs(
+                    lon[sl],lat[sl],uu[sl],vv[sl],length=4.5,linewidth=.45,
+                    color="black",transform=ccrs.PlateCarree(),zorder=7,
+                )
             elif lon.ndim==1 and lat.ndim==1:
-                xx,yy=np.meshgrid(lon,lat); sl=(slice(None,None,skip),slice(None,None,skip))
-                ax.barbs(xx[sl],yy[sl],uu[sl],vv[sl],length=4.5,linewidth=.45,color="black",transform=ccrs.PlateCarree(),zorder=7)
+                xx,yy=np.meshgrid(lon,lat)
+                sl=(slice(None,None,skip),slice(None,None,skip))
+                ax.barbs(
+                    xx[sl],yy[sl],uu[sl],vv[sl],length=4.5,linewidth=.45,
+                    color="black",transform=ccrs.PlateCarree(),zorder=7,
+                )
     return ax
-
 
 def overlay_interactive_mrms(fig,mrms_ds,*,min_dbz=10.0):
     """Overlay MRMS reflectivity without converting an interactive map to Matplotlib."""
